@@ -750,6 +750,7 @@ function emptyMetrics() {
     web_search_count: 0, web_searches: [],
     lines_added: 0, lines_removed: 0,
     api_duration_ms: 0,
+    user_prompts: [], // [{text, ts}] — user-typed messages from main session
   };
 }
 
@@ -1366,6 +1367,20 @@ async function extractClaudeSessionData(transcriptPath) {
             }
           }
         }
+
+        // Collect user-typed prompts (only from main file, skip tool results)
+        if (isMainFile && texts.length > 0) {
+          // Skip pure tool-result messages (content blocks are all tool_result type)
+          const isToolResult = Array.isArray(content) && content.length > 0
+            && content.every(b => b && b.type === "tool_result");
+          if (!isToolResult) {
+            const combined = texts.join("\n").trim();
+            if (combined) {
+              metrics.user_prompts.push({ text: combined, ts: item.timestamp || "" });
+            }
+          }
+        }
+
         return;
       }
 
@@ -1760,7 +1775,8 @@ async function safeExtractSessionData(session) {
   const hasCostsByDay = cache[dKey] && typeof cache[dKey].costsByHour === "object";
   const hasLocalDates = cache[dKey] && cache[dKey]._localDates === true;
   const hasNoSubagentModel = cache[dKey] && cache[dKey]._noSubagentModel === true;
-  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay && hasLocalDates && hasNoSubagentModel) {
+  const hasUserPrompts = cachedMetrics && Array.isArray(cachedMetrics.user_prompts);
+  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay && hasLocalDates && hasNoSubagentModel && hasUserPrompts) {
     SESSION_DATA_CACHE.set(memKey, cache[dKey]);
     SESSION_DATA_MTIME.set(memKey, effectiveMtime);
     return cache[dKey];
@@ -3975,7 +3991,7 @@ function renderBottomPanels(session, data, plan, width, panelHeight, activeTab, 
     case 1: contentLines = renderSystemPanel(session, data, width, innerH); break;
     case 2: contentLines = renderAgentPanel(session, data, width, innerH, state); break;
     case 3: contentLines = renderCostPanel(session, data, plan, width, innerH, state.costScroll, state); break;
-    case 4: contentLines = renderConfigPanel(session, width, innerH, state); break;
+    case 4: contentLines = renderConfigPanel(session, data, width, innerH, state); break;
     default: contentLines = renderSessionInfoPanel(session, data, plan, width, innerH);
   }
 
@@ -4725,7 +4741,7 @@ function renderAgentPanel(session, data, panelW, rows, state) {
 const CONFIG_TAB_WIDTH = 14; // width of the vertical tab sidebar
 
 /** Render the Config panel with vertical sub-tabs and scrollable content. */
-function renderConfigPanel(session, panelW, rows, state) {
+function renderConfigPanel(session, data, panelW, rows, state) {
   const lines = [];
 
   if (!session) {
@@ -4735,6 +4751,46 @@ function renderConfigPanel(session, panelW, rows, state) {
   }
 
   const sections = getSessionConfig(session);
+
+  // Dynamically build "Prompts" section from user-typed messages + Agent tool invocations
+  const userPrompts = (data && data.metrics && data.metrics.user_prompts) || [];
+  const agentEntries = (data && data.metrics && data.metrics.tool_details && data.metrics.tool_details["Agent"]) || [];
+  const promptLines = [];
+  if (userPrompts.length === 0 && agentEntries.length === 0) {
+    promptLines.push(`\x1b[38;5;238mNo prompts recorded\x1b[0m`);
+  } else {
+    if (userPrompts.length > 0) {
+      promptLines.push(`\x1b[1;38;5;214mUser Prompts\x1b[0m`);
+      promptLines.push("");
+      for (let i = 0; i < userPrompts.length; i++) {
+        const e = userPrompts[i];
+        const ts = e.ts ? `\x1b[38;5;245m${e.ts.slice(0, 19).replace("T", " ")}\x1b[0m  ` : "";
+        promptLines.push(`\x1b[1;38;5;75m#${i + 1}\x1b[0m  ${ts}`);
+        for (const l of e.text.split("\n")) promptLines.push("  " + sanitizeLine(l));
+        promptLines.push("");
+      }
+    }
+    if (agentEntries.length > 0) {
+      promptLines.push(`\x1b[1;38;5;214mAgent Sub-prompts\x1b[0m`);
+      promptLines.push("");
+      for (let i = 0; i < agentEntries.length; i++) {
+        const e = agentEntries[i];
+        const ts = e.ts ? `\x1b[38;5;245m${e.ts.slice(0, 19).replace("T", " ")}\x1b[0m  ` : "";
+        promptLines.push(`\x1b[1;38;5;75m#${i + 1}\x1b[0m  ${ts}`);
+        const full = e.full || e.d || "";
+        for (const l of full.split("\n")) promptLines.push("  " + sanitizeLine(l));
+        promptLines.push("");
+      }
+    }
+  }
+  // Insert Prompts section if not already present (avoids duplicate on hot reload)
+  if (!sections.find(s => s.label === "Prompts")) {
+    sections.push({ label: "Prompts", lines: promptLines, copyPath: "" });
+  } else {
+    // Update in place so content stays fresh
+    const ps = sections.find(s => s.label === "Prompts");
+    ps.lines = promptLines;
+  }
   if (sections.length === 0) {
     lines.push(C.dimText + "No configuration files found" + RESET);
     while (lines.length < rows) lines.push("");
