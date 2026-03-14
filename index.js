@@ -2334,6 +2334,16 @@ function applyTheme(name) {
   RESET = name === "sysdig" ? _RESET_SYSDIG : _RESET_DEFAULT;
 }
 
+// Lumin octopus — braille art derived from ascii-art.txt via LANCZOS downscale
+// 20×20 pixel grid encoded as braille (2×4 dots per char) → 10 chars × 5 lines
+const LUMIN_ART = [
+  "\u2800\u2800\u2800\u2870\u281a\u2819\u2822\u2840\u2800\u2800",
+  "\u28b0\u285f\u2817\u2847\u28e4\u28a0\u2844\u2857\u281f\u28f7",
+  "\u2808\u283b\u2876\u28bf\u2824\u2864\u28be\u2836\u287e\u280b",
+  "\u28a0\u285e\u28ab\u28ff\u28fa\u289f\u28ae\u28eb\u289b\u2846",
+  "\u2800\u2809\u2818\u28f7\u2817\u2818\u28a7\u281f\u2808\u2801",
+];
+
 // ---------------------------------------------------------------------------
 // Box-drawing helpers (btop-style rounded corners)
 // ---------------------------------------------------------------------------
@@ -3683,6 +3693,33 @@ function renderHeader(stats, width, state) {
   const row2Left = buildOverviewCell(tokLabel, tokChart, labelW, chartW, colW);
   const row2Right = buildOverviewCell(memLabel, "", labelW, 0, colW);
   lines.push(boxLine(row2Left + " ".repeat(gap) + row2Right, width));
+
+  // Overlay Lumin octopus in top-right of Overview panel when Sysdig theme active
+  if (state.theme === "sysdig") {
+    const artW = 10; // visible width of braille art (10 chars)
+    const artH = LUMIN_ART.length; // 5 lines
+    const artPad = 2; // padding from right border
+    const artX = width - artW - artPad;
+    if (artX > 45) {
+      // Add extra empty rows inside the box so the octopus has room
+      const extraRows = Math.max(0, artH - 2); // 2 data rows already exist
+      for (let i = 0; i < extraRows; i++) {
+        lines.push(boxLine(" ".repeat(width - 4), width));
+      }
+      // Overlay art on the right side of content rows (starting at row 1)
+      for (let a = 0; a < artH; a++) {
+        const lineIdx = 1 + a;
+        if (lineIdx < lines.length) {
+          const bgLine = lines[lineIdx];
+          const left = ansiSlice(bgLine, 0, artX);
+          const artLine = C.costGreen + LUMIN_ART[a] + RESET;
+          const rightStart = artX + artW;
+          const right = ansiSlice(bgLine, rightStart, width - rightStart);
+          lines[lineIdx] = left + artLine + right;
+        }
+      }
+    }
+  }
 
   lines.push(boxBottom(width));
   return lines;
