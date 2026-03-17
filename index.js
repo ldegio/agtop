@@ -242,6 +242,7 @@ KEYBOARD SHORTCUTS (interactive mode)
   F7                     Filter sessions by age (1d / 1w / 1mo)
   F5 or r                Force refresh
   d                      Delete selected session (non-running only, with confirmation)
+  t                      Toggle color theme (default / sysdig)
   q or F10               Quit
 
 MOUSE
@@ -849,11 +850,11 @@ function wrapLine(text, maxW) {
     vis++;
     if (vis >= maxW) {
       if (lastBreak > start) {
-        result.push(text.slice(start, lastBreak + 1) + "\x1b[0m");
+        result.push(text.slice(start, lastBreak + 1) + RESET);
         start = lastBreak + 1;
         vis = vis - lastBreakVis - 1;
       } else {
-        result.push(text.slice(start, i + 1) + "\x1b[0m");
+        result.push(text.slice(start, i + 1) + RESET);
         start = i + 1;
         vis = 0;
       }
@@ -867,7 +868,7 @@ function wrapLine(text, maxW) {
 
 /** Helper: format a "not found" line for a config file. */
 function notFoundLine(text) {
-  return `\x1b[38;5;238m${text}\x1b[0m`;
+  return `\x1b[38;5;238m${text}${RESET}`;
 }
 
 /** Sanitize a line for terminal display: replace tabs, strip \r and other control chars. */
@@ -880,11 +881,11 @@ function formatConfigFile(filePath, displayPath, maxLines) {
   const content = safeReadFile(filePath);
   if (!content) return null;
   const lines = [];
-  lines.push(`\x1b[1;38;5;75m${displayPath}\x1b[0m`);
+  lines.push(`\x1b[1;38;5;75m${displayPath}${RESET}`);
   const srcLines = content.split("\n");
   const limit = maxLines || 50;
   for (const l of srcLines.slice(0, limit)) lines.push("  " + sanitizeLine(l));
-  if (srcLines.length > limit) lines.push("  \x1b[38;5;245m... (truncated)\x1b[0m");
+  if (srcLines.length > limit) lines.push(`  \x1b[38;5;245m... (truncated)${RESET}`);
   lines.push("");
   return lines;
 }
@@ -951,9 +952,9 @@ function extractClaudeConfig(session) {
         const descMatch = skillMd.match(/description:\s*(.+)/i);
         const name = nameMatch ? nameMatch[1].trim() : d;
         const desc = descMatch ? descMatch[1].trim() : "";
-        skillLines.push(`\x1b[38;5;114m${name}\x1b[0m` + (desc ? `  \x1b[38;5;245m${desc}\x1b[0m` : ""));
+        skillLines.push(`\x1b[38;5;114m${name}${RESET}` + (desc ? `  \x1b[38;5;245m${desc}${RESET}` : ""));
       } else {
-        skillLines.push(`\x1b[38;5;114m${d}\x1b[0m`);
+        skillLines.push(`\x1b[38;5;114m${d}${RESET}`);
       }
     }
   }
@@ -969,7 +970,7 @@ function extractClaudeConfig(session) {
       const settings = JSON.parse(settingsContent);
       if (settings.mcpServers) {
         for (const [name, cfg] of Object.entries(settings.mcpServers)) {
-          mcpLines.push(`\x1b[38;5;180m${name}\x1b[0m  \x1b[38;5;245m(global)\x1b[0m`);
+          mcpLines.push(`\x1b[38;5;180m${name}${RESET}  \x1b[38;5;245m(global)${RESET}`);
           if (cfg.command) mcpLines.push(`  command: ${cfg.command}`);
         }
       }
@@ -986,7 +987,7 @@ function extractClaudeConfig(session) {
         const servers = mcp.mcpServers || mcp;
         for (const [name, cfg] of Object.entries(servers)) {
           if (typeof cfg !== "object") continue;
-          mcpLines.push(`\x1b[38;5;180m${name}\x1b[0m  \x1b[38;5;245m(project)\x1b[0m`);
+          mcpLines.push(`\x1b[38;5;180m${name}${RESET}  \x1b[38;5;245m(project)${RESET}`);
           if (cfg.command) mcpLines.push(`  command: ${cfg.command}`);
         }
       } catch {}
@@ -1012,14 +1013,14 @@ function extractClaudeConfig(session) {
       const perms = ps.permissions;
       if (!perms) continue;
       if (perms.allow && perms.allow.length)
-        permLines.push(`\x1b[38;5;114mallow\x1b[0m \x1b[38;5;245m(${pf.label})\x1b[0m: ${perms.allow.join(", ")}`);
+        permLines.push(`\x1b[38;5;114mallow${RESET} \x1b[38;5;245m(${pf.label})${RESET}: ${perms.allow.join(", ")}`);
       if (perms.deny && perms.deny.length)
-        permLines.push(`\x1b[38;5;167mdenied\x1b[0m \x1b[38;5;245m(${pf.label})\x1b[0m: ${perms.deny.join(", ")}`);
+        permLines.push(`\x1b[38;5;167mdenied${RESET} \x1b[38;5;245m(${pf.label})${RESET}: ${perms.deny.join(", ")}`);
       if (perms.ask && perms.ask.length)
-        permLines.push(`\x1b[38;5;180mask\x1b[0m \x1b[38;5;245m(${pf.label})\x1b[0m: ${perms.ask.join(", ")}`);
+        permLines.push(`\x1b[38;5;180mask${RESET} \x1b[38;5;245m(${pf.label})${RESET}: ${perms.ask.join(", ")}`);
     } catch {}
   }
-  if (permLines.length === 0) permLines.push(`\x1b[38;5;238mNo permission rules configured\x1b[0m`);
+  if (permLines.length === 0) permLines.push(`\x1b[38;5;238mNo permission rules configured${RESET}`);
   sections.push({ label: "Permissions", lines: permLines, copyPath: settingsPath });
 
   return sections;
@@ -1073,9 +1074,9 @@ function extractCodexConfig(session) {
         const descMatch = skillMd.match(/description:\s*(.+)/i);
         const name = nameMatch ? nameMatch[1].trim() : d;
         const desc = descMatch ? descMatch[1].trim() : "";
-        skillLines.push(`\x1b[38;5;114m${name}\x1b[0m` + (desc ? `  \x1b[38;5;245m${desc}\x1b[0m` : ""));
+        skillLines.push(`\x1b[38;5;114m${name}${RESET}` + (desc ? `  \x1b[38;5;245m${desc}${RESET}` : ""));
       } else {
-        skillLines.push(`\x1b[38;5;114m${d}\x1b[0m`);
+        skillLines.push(`\x1b[38;5;114m${d}${RESET}`);
       }
     }
   }
@@ -1088,7 +1089,7 @@ function extractCodexConfig(session) {
     const mcpRe = /^\[mcp_servers\.([^\]]+)\]/gm;
     let m;
     while ((m = mcpRe.exec(globalToml)) !== null) {
-      mcpLines.push(`\x1b[38;5;180m${m[1]}\x1b[0m`);
+      mcpLines.push(`\x1b[38;5;180m${m[1]}${RESET}`);
     }
   }
   if (mcpLines.length === 0) mcpLines.push(notFoundLine("No MCP servers in config.toml"));
@@ -2107,12 +2108,14 @@ const MOUSE_ON = "\x1b[?1000h\x1b[?1003h\x1b[?1006h"; // SGR mouse + any-event t
 const MOUSE_OFF = "\x1b[?1006l\x1b[?1003l\x1b[?1000l";
 const SYNC_START = "\x1b[?2026h";
 const SYNC_END = "\x1b[?2026l";
-const RESET = "\x1b[0m";
+const _RESET_DEFAULT = "\x1b[0m";
+const _RESET_SYSDIG = "\x1b[0m\x1b[38;2;234;235;237;48;2;1;53;62m";
+let RESET = _RESET_DEFAULT;
 const BOLD = "\x1b[1m";
 const DIM = "\x1b[2m";
 
 // btop-style color palette — dark bg, vibrant accents, rounded box borders
-const C = {
+const DEFAULT_THEME = {
   // Panel borders and titles
   border: "\x1b[38;5;60m",      // muted blue-gray for box borders
   borderHi: "\x1b[38;5;75m",    // brighter blue for active panel border / tab underlines
@@ -2150,7 +2153,196 @@ const C = {
   normalFg: "\x1b[37m",        // white
   searchFg: "\x1b[1;36m",      // bold cyan
   accent: "\x1b[38;5;75m",     // accent blue
+  // Tabs
+  tabHover: "\x1b[4;38;5;179m",       // underline amber on hover
+  tabInactive: "\x1b[38;5;245m",      // gray inactive tab
+  tabRuleDim: "\x1b[38;5;238m",       // dim rule line
+  tabRuleHover: "\x1b[38;5;245m",     // hover rule
+  // Live button
+  liveActive: "\x1b[1;38;5;114m",     // bright green active
+  liveBtnFg: "\x1b[1;38;5;16m",       // black text
+  liveBtnBg: "\x1b[48;5;114m",        // green bg
+  liveHover: "\x1b[4;38;5;179m",      // underline amber hover
+  liveInactive: "\x1b[38;5;245m",     // gray inactive
+  // Tool activity panel
+  toolActive: "\x1b[1;38;5;255m",         // bold white active tool
+  toolActiveActivity: "\x1b[1;38;5;114m", // bold green active + recent
+  toolHover: "\x1b[4;38;5;250m",          // underline gray hover
+  toolHoverActivity: "\x1b[4;38;5;114m",  // underline green hover + recent
+  toolInactive: "\x1b[38;5;245m",         // gray inactive
+  toolInactiveActivity: "\x1b[38;5;114m", // green inactive + recent
+  toolFlash: "\x1b[1;38;5;114m",          // flash on count change
+  toolSep: "\x1b[38;5;238m",              // separator
+  // Scrollbar
+  scrollThumb: "\x1b[38;5;245m",
+  scrollTrack: "\x1b[38;5;238m",
+  // Copy icons
+  copyIcon: "\x1b[38;5;60m",
+  copyFlash: "\x1b[38;5;114m",
+  // Arrow hover
+  arrowHover: "\x1b[1;38;5;255m",
+  // Filter dismiss
+  filterX: "\x1b[38;5;167m",
+  filterXHover: "\x1b[1;4;38;5;203m",
+  ageLabel: "\x1b[1;38;5;179m",
+  // Delete modal
+  deleteBorder: "\x1b[38;5;196;48;5;52m",
+  deleteLabel: "\x1b[1;38;5;203;48;5;52m",
+  deletePath: "\x1b[38;5;252;48;5;52m",
+  deleteHint: "\x1b[38;5;245;48;5;52m",
+  // Inactivity modal
+  checkActive: "\x1b[1;38;5;114m",
+  checkInactive: "\x1b[38;5;240m",
+  cursorText: "\x1b[1;38;5;255;48;5;238m",
+  cursorBg: "\x1b[48;5;238m",
+  // Model colors
+  modelClaude: "\x1b[38;5;173m",
+  modelCodex: "\x1b[38;5;110m",
+  // Sparkline ramps (arrays: near-zero → low → medium → high → critical)
+  sparkCpu: ["\x1b[38;5;22m", "\x1b[38;5;71m", "\x1b[38;5;114m", "\x1b[38;5;186m", "\x1b[38;5;221m", "\x1b[38;5;203m"],
+  sparkSpend: ["\x1b[38;5;22m", "\x1b[38;5;71m", "\x1b[38;5;114m", "\x1b[38;5;186m", "\x1b[38;5;221m", "\x1b[38;5;203m"],
+  sparkAccent: ["\x1b[38;5;238m", "\x1b[38;5;60m", "\x1b[38;5;68m", "\x1b[38;5;75m", "\x1b[38;5;117m"],
+  sparkDimBase: "\x1b[38;5;236m",
+  sparkDimBaseCpu: "\x1b[38;5;22m",
 };
+
+// Sysdig brand color palette — truecolor ANSI (24-bit)
+// Background: Deep See #01353E. Borders must contrast against it.
+const SYSDIG_THEME = {
+  // Panel borders and titles — border is lightened Deep See for visibility
+  border: "\x1b[38;2;40;100;115m",       // lightened Deep See ~#286473
+  borderHi: "\x1b[38;2;0;203;226m",      // Falco Blue #00CBE2
+  panelTitle: "\x1b[1;38;2;189;247;139m", // Lumin #BDF78B (bold)
+  // Labels and values
+  hdrLabel: "\x1b[1;38;2;0;203;226m",    // Falco Blue #00CBE2 (bold)
+  hdrValue: "\x1b[1;38;2;234;235;237m",  // Grey-10 #EAEBED (bold) — high contrast on teal
+  hdrCyan: "\x1b[1;38;2;0;203;226m",     // Falco Blue #00CBE2 (bold)
+  hdrGreen: "\x1b[1;38;2;189;247;139m",  // Lumin #BDF78B (bold)
+  hdrYellow: "\x1b[1;38;2;253;216;53m",  // Yellow #FDD835 (bold)
+  hdrDim: "\x1b[38;2;187;189;191m",      // Grey-20 #BBBDBF — readable on teal
+  // Column headers — elevated surface
+  colHdrBg: "\x1b[1;38;2;234;235;237;48;2;10;74;85m", // Grey-10 on elevated Deep See
+  // Selected row — elevated surface with Falco Blue left-edge feel
+  selBg: "\x1b[48;2;10;74;85m",          // elevated Deep See #0A4A55
+  selFg: "\x1b[1;38;2;234;235;237m",     // Grey-10 (bold)
+  // Footer — grounded, dark
+  footerKey: "\x1b[1;38;2;1;53;62;48;2;0;203;226m", // Deep See on Falco Blue (bold)
+  footerLabel: "\x1b[38;2;187;189;191;48;2;10;74;85m", // Grey-20 on elevated Deep See
+  footerBg: "\x1b[48;2;10;74;85m",       // elevated Deep See
+  // Provider colors
+  provClaude: "\x1b[38;2;202;135;218m",  // Purple #CA87DA
+  provCodex: "\x1b[38;2;189;247;139m",   // Lumin #BDF78B
+  // Cost colors
+  costGreen: "\x1b[38;2;189;247;139m",   // Lumin #BDF78B
+  costYellow: "\x1b[38;2;253;216;53m",   // Yellow #FDD835
+  costRed: "\x1b[1;38;2;255;119;116m",   // Red #FF7774 (bold)
+  // Chart colors
+  chartBar: "\x1b[38;2;0;203;226m",      // Falco Blue #00CBE2
+  chartBarHi: "\x1b[38;2;255;119;116m",  // Red #FF7774
+  chartBarMed: "\x1b[38;2;255;169;64m",  // Orange #FFA940
+  chartBarLow: "\x1b[38;2;189;247;139m", // Lumin #BDF78B
+  // Misc
+  dimText: "\x1b[38;2;138;140;142m",     // Grey-30 #8A8C8E
+  normalFg: "\x1b[38;2;234;235;237m",    // Grey-10 #EAEBED
+  searchFg: "\x1b[1;38;2;0;203;226m",    // Falco Blue #00CBE2 (bold)
+  accent: "\x1b[38;2;0;203;226m",        // Falco Blue #00CBE2
+  // Tabs — Falco Blue active, Grey-20 inactive
+  tabHover: "\x1b[4;38;2;0;203;226m",         // underline Falco Blue
+  tabInactive: "\x1b[38;2;138;140;142m",      // Grey-30
+  tabRuleDim: "\x1b[38;2;40;100;115m",        // lightened Deep See
+  tabRuleHover: "\x1b[38;2;138;140;142m",     // Grey-30
+  // Live button — Lumin accent
+  liveActive: "\x1b[1;38;2;189;247;139m",     // Lumin bold
+  liveBtnFg: "\x1b[1;38;2;1;53;62m",          // Deep See text
+  liveBtnBg: "\x1b[48;2;189;247;139m",        // Lumin bg
+  liveHover: "\x1b[4;38;2;0;203;226m",        // underline Falco Blue
+  liveInactive: "\x1b[38;2;138;140;142m",     // Grey-30
+  // Tool activity panel
+  toolActive: "\x1b[1;38;2;234;235;237m",         // bold Grey-10
+  toolActiveActivity: "\x1b[1;38;2;189;247;139m",  // bold Lumin
+  toolHover: "\x1b[4;38;2;187;189;191m",           // underline Grey-20
+  toolHoverActivity: "\x1b[4;38;2;189;247;139m",   // underline Lumin
+  toolInactive: "\x1b[38;2;138;140;142m",          // Grey-30
+  toolInactiveActivity: "\x1b[38;2;189;247;139m",  // Lumin
+  toolFlash: "\x1b[1;38;2;189;247;139m",           // bold Lumin flash
+  toolSep: "\x1b[38;2;40;100;115m",                // lightened Deep See
+  // Scrollbar
+  scrollThumb: "\x1b[38;2;138;140;142m",   // Grey-30
+  scrollTrack: "\x1b[38;2;40;100;115m",     // lightened Deep See
+  // Copy icons
+  copyIcon: "\x1b[38;2;40;100;115m",       // lightened Deep See
+  copyFlash: "\x1b[38;2;189;247;139m",     // Lumin
+  // Arrow hover
+  arrowHover: "\x1b[1;38;2;234;235;237m",  // bold Grey-10
+  // Filter dismiss
+  filterX: "\x1b[38;2;255;119;116m",       // Red
+  filterXHover: "\x1b[1;4;38;2;255;119;116m", // bold underline Red
+  ageLabel: "\x1b[1;38;2;189;247;139m",    // Lumin
+  // Delete modal — Red on dark elevated surface
+  deleteBorder: "\x1b[38;2;255;119;116;48;2;62;20;20m",
+  deleteLabel: "\x1b[1;38;2;255;119;116;48;2;62;20;20m",
+  deletePath: "\x1b[38;2;234;235;237;48;2;62;20;20m",
+  deleteHint: "\x1b[38;2;138;140;142;48;2;62;20;20m",
+  // Inactivity modal
+  checkActive: "\x1b[1;38;2;189;247;139m",           // Lumin
+  checkInactive: "\x1b[38;2;83;85;87m",               // Grey-50
+  cursorText: "\x1b[1;38;2;234;235;237;48;2;10;74;85m", // Grey-10 on elevated
+  cursorBg: "\x1b[48;2;10;74;85m",                    // elevated Deep See
+  // Model colors
+  modelClaude: "\x1b[38;2;202;135;218m",   // Purple
+  modelCodex: "\x1b[38;2;0;203;226m",      // Falco Blue
+  // Sparkline ramps — Sysdig brand gradient: Lumin → Yellow → Orange → Red
+  sparkCpu: [
+    "\x1b[38;2;10;74;85m",    // near-zero: muted Deep See
+    "\x1b[38;2;94;180;80m",   // low: muted Lumin
+    "\x1b[38;2;189;247;139m", // medium: Lumin
+    "\x1b[38;2;253;216;53m",  // medium-high: Yellow
+    "\x1b[38;2;255;169;64m",  // high: Orange
+    "\x1b[38;2;255;119;116m", // critical: Red
+  ],
+  sparkSpend: [
+    "\x1b[38;2;10;74;85m",    // near-zero: muted Deep See
+    "\x1b[38;2;94;180;80m",   // low: muted Lumin
+    "\x1b[38;2;189;247;139m", // medium: Lumin
+    "\x1b[38;2;253;216;53m",  // medium-high: Yellow
+    "\x1b[38;2;255;169;64m",  // high: Orange
+    "\x1b[38;2;255;119;116m", // critical: Red
+  ],
+  sparkAccent: [
+    "\x1b[38;2;40;100;115m",  // near-zero: lightened Deep See
+    "\x1b[38;2;0;120;140m",   // low: muted Falco
+    "\x1b[38;2;0;160;180m",   // medium: mid Falco
+    "\x1b[38;2;0;203;226m",   // high: Falco Blue
+    "\x1b[38;2;189;247;139m", // peak: Lumin
+  ],
+  sparkDimBase: "\x1b[38;2;40;100;115m",    // lightened Deep See
+  sparkDimBaseCpu: "\x1b[38;2;10;74;85m",   // muted Deep See
+};
+
+const THEMES = { default: DEFAULT_THEME, sysdig: SYSDIG_THEME };
+let C = { ...DEFAULT_THEME };
+
+// Active theme background escape — applied per-frame, not via OSC
+const SYSDIG_BG_SEQ = "\x1b[48;2;1;53;62m";  // Deep See bg
+const DEFAULT_BG_SEQ = "";                     // no forced bg (terminal default)
+let _themeBg = DEFAULT_BG_SEQ;
+
+function applyTheme(name) {
+  const theme = THEMES[name] || THEMES.default;
+  Object.assign(C, theme);
+  _themeBg = name === "sysdig" ? SYSDIG_BG_SEQ : DEFAULT_BG_SEQ;
+  RESET = name === "sysdig" ? _RESET_SYSDIG : _RESET_DEFAULT;
+}
+
+// Lumin octopus — braille art derived from ascii-art.txt via LANCZOS downscale
+// 20×20 pixel grid encoded as braille (2×4 dots per char) → 10 chars × 5 lines
+const LUMIN_ART = [
+  "\u2800\u2800\u2800\u2870\u281a\u2819\u2822\u2840\u2800\u2800",
+  "\u28b0\u285f\u2817\u2847\u28e4\u28a0\u2844\u2857\u281f\u28f7",
+  "\u2808\u283b\u2876\u28bf\u2824\u2864\u28be\u2836\u287e\u280b",
+  "\u28a0\u285e\u28ab\u28ff\u28fa\u289f\u28ae\u28eb\u289b\u2846",
+  "\u2800\u2809\u2818\u28f7\u2817\u2818\u28a7\u281f\u2808\u2801",
+];
 
 // ---------------------------------------------------------------------------
 // Box-drawing helpers (btop-style rounded corners)
@@ -2166,7 +2358,8 @@ function boxTop(width, title, highlight) {
     return bc + BOX.tl + BOX.h.repeat(width - 2) + BOX.tr + RESET;
   }
   const label = ` ${title} `;
-  const after = Math.max(0, width - 3 - label.length);
+  const visLen = label.replace(/\x1b\[[^m]*m/g, "").length;
+  const after = Math.max(0, width - 3 - visLen);
   return bc + BOX.tl + BOX.h + RESET + tc + label + RESET + bc + BOX.h.repeat(after) + BOX.tr + RESET;
 }
 
@@ -2215,33 +2408,34 @@ function pushHistory(map, key, value) {
   if (arr.length > HISTORY_MAX) arr.shift();
 }
 
-// btop-style smooth gradient: green(114) → teal(79) → yellow(221) → red(203)
+// Theme-aware sparkline color ramps
 function sparkColor(ratio) {
-  if (ratio <= 0.01) return "\x1b[38;5;22m";  // near-zero: dark forest green
-  if (ratio <= 0.30) return "\x1b[38;5;71m";  // low: muted green
-  if (ratio <= 0.50) return "\x1b[38;5;114m"; // medium-low: green
-  if (ratio <= 0.70) return "\x1b[38;5;186m"; // medium: yellow-green
-  if (ratio <= 0.85) return "\x1b[38;5;221m"; // medium-high: yellow
-  return "\x1b[38;5;203m";                     // high: red
+  const r = C.sparkCpu;
+  if (ratio <= 0.01) return r[0];
+  if (ratio <= 0.30) return r[1];
+  if (ratio <= 0.50) return r[2];
+  if (ratio <= 0.70) return r[3];
+  if (ratio <= 0.85) return r[4];
+  return r[5];
 }
 
-// Accent-only gradient (blue/cyan tones, no red) for non-CPU metrics
 function sparkColorAccent(ratio) {
-  if (ratio <= 0.01) return "\x1b[38;5;238m"; // near-zero: dark gray
-  if (ratio <= 0.25) return "\x1b[38;5;60m";  // low: muted blue
-  if (ratio <= 0.50) return "\x1b[38;5;68m";  // medium-low: steel blue
-  if (ratio <= 0.75) return "\x1b[38;5;75m";  // medium: bright blue
-  return "\x1b[38;5;117m";                     // high: cyan
+  const r = C.sparkAccent;
+  if (ratio <= 0.01) return r[0];
+  if (ratio <= 0.25) return r[1];
+  if (ratio <= 0.50) return r[2];
+  if (ratio <= 0.75) return r[3];
+  return r[4];
 }
 
-// Green-to-red gradient for spend/token metrics
 function sparkColorSpend(ratio) {
-  if (ratio <= 0.01) return "\x1b[38;5;22m";  // near-zero: dark forest green
-  if (ratio <= 0.25) return "\x1b[38;5;71m";  // low: muted green
-  if (ratio <= 0.50) return "\x1b[38;5;114m"; // medium: green
-  if (ratio <= 0.75) return "\x1b[38;5;186m"; // medium-high: yellow-green
-  if (ratio <= 0.85) return "\x1b[38;5;221m"; // high: yellow
-  return "\x1b[38;5;203m";                     // very high: red
+  const r = C.sparkSpend;
+  if (ratio <= 0.01) return r[0];
+  if (ratio <= 0.25) return r[1];
+  if (ratio <= 0.50) return r[2];
+  if (ratio <= 0.75) return r[3];
+  if (ratio <= 0.85) return r[4];
+  return r[5];
 }
 
 /**
@@ -2257,7 +2451,7 @@ function renderBrailleSparkline(values, width, maxVal, colorMode) {
   // Left-column braille bits, bottom-to-top: bit3(0x40), bit2(0x04), bit1(0x02), bit0(0x01)
   const bits = [0x40, 0x04, 0x02, 0x01]; // row 3, 2, 1, 0
   const baseline = String.fromCharCode(0x2800 | 0x40); // bottom dot only
-  const dimBase = (colorMode === "spend" || colorMode === "cpu") ? "\x1b[38;5;22m" : "\x1b[38;5;236m";
+  const dimBase = (colorMode === "spend" || colorMode === "cpu") ? C.sparkDimBaseCpu : C.sparkDimBase;
 
   if (!values.length) {
     return (dimBase + baseline + RESET).repeat(width);
@@ -2507,7 +2701,7 @@ const COL_COST_RATE = {
 };
 const COL_CPU = {
   key: "cpu", label: "CPU%", width: 5, align: "right", desc: "CPU usage of session processes",
-  render: (s) => s.process ? `${s.process.cpu}` : "\x1b[38;5;238m─\x1b[0m",
+  render: (s) => s.process ? `${s.process.cpu}` : "\x1b[38;5;238m─" + RESET,
   compare: (a, b) => ((a.process && a.process.cpu) || 0) - ((b.process && b.process.cpu) || 0),
 };
 const COL_MEM = {
@@ -2549,7 +2743,7 @@ const COMPACT_THRESHOLD = process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
 const COL_CTX = {
   key: "ctx", label: "CTX%", width: 6, align: "right", desc: "Context window usage (% until auto-compact)",
   render: (s) => {
-    if (!s.list_context) return "\x1b[38;5;238m─\x1b[0m";
+    if (!s.list_context) return "\x1b[38;5;238m─" + RESET;
     if (s.list_context.compacting) return "COMPCT";
     const compactAt = s.list_context.max * COMPACT_THRESHOLD;
     const pct = Math.round((s.list_context.used / compactAt) * 100);
@@ -2567,12 +2761,12 @@ const COL_CTX = {
 };
 const COL_COST_HOUR = {
   key: "cost_hour", label: "$/1H", width: 7, align: "right", desc: "Cost in the last hour",
-  render: (s) => s.list_cost_hour > 0 ? compactUsd(s.list_cost_hour) : "\x1b[38;5;238m─\x1b[0m",
+  render: (s) => s.list_cost_hour > 0 ? compactUsd(s.list_cost_hour) : "\x1b[38;5;238m─" + RESET,
   compare: (a, b) => (a.list_cost_hour || 0) - (b.list_cost_hour || 0),
 };
 const COL_COST_TODAY = {
   key: "cost_today", label: "$/1D", width: 7, align: "right", desc: "Cost since midnight (local time)",
-  render: (s) => s.list_cost_today > 0 ? compactUsd(s.list_cost_today) : "\x1b[38;5;238m─\x1b[0m",
+  render: (s) => s.list_cost_today > 0 ? compactUsd(s.list_cost_today) : "\x1b[38;5;238m─" + RESET,
   compare: (a, b) => (a.list_cost_today || 0) - (b.list_cost_today || 0),
 };
 const COL_PROJECT = {
@@ -3253,6 +3447,7 @@ function createState() {
     _hoverColKey: null, // column key being hovered on header row
     _quota: { ts: 0, fetched: false, claude: null, codex: null }, // provider quota data
     _quotaTick: QUOTA_INTERVAL_TICKS - 1, // fetch on first tick
+    theme: "default", // "default" | "sysdig"
   };
 }
 
@@ -3521,7 +3716,8 @@ function updateOverviewHistory(stats) {
 
 function renderHeader(stats, width, state) {
   const lines = [];
-  lines.push(boxTop(width, "Overview"));
+  const overviewTitle = state.theme === "sysdig" ? "Overview ◉ Sysdig" : "Overview";
+  lines.push(boxTop(width, overviewTitle));
 
   const curSpend = stats.spendTotal || 0;
   const curTokens = (stats.totalInput || 0) + (stats.totalOutput || 0);
@@ -3550,6 +3746,33 @@ function renderHeader(stats, width, state) {
   const row2Left = buildOverviewCell(tokLabel, tokChart, labelW, chartW, colW);
   const row2Right = buildOverviewCell(memLabel, "", labelW, 0, colW);
   lines.push(boxLine(row2Left + " ".repeat(gap) + row2Right, width));
+
+  // Overlay Lumin octopus in top-right of Overview panel when Sysdig theme active
+  if (state.theme === "sysdig") {
+    const artW = 10; // visible width of braille art (10 chars)
+    const artH = LUMIN_ART.length; // 5 lines
+    const artPad = 2; // padding from right border
+    const artX = width - artW - artPad;
+    if (artX > 45) {
+      // Add extra empty rows inside the box so the octopus has room
+      const extraRows = Math.max(0, artH - 2); // 2 data rows already exist
+      for (let i = 0; i < extraRows; i++) {
+        lines.push(boxLine(" ".repeat(width - 4), width));
+      }
+      // Overlay art on the right side of content rows (starting at row 1)
+      for (let a = 0; a < artH; a++) {
+        const lineIdx = 1 + a;
+        if (lineIdx < lines.length) {
+          const bgLine = lines[lineIdx];
+          const left = ansiSlice(bgLine, 0, artX);
+          const artLine = C.costGreen + LUMIN_ART[a] + RESET;
+          const rightStart = artX + artW;
+          const right = ansiSlice(bgLine, rightStart, width - rightStart);
+          lines[lineIdx] = left + artLine + right;
+        }
+      }
+    }
+  }
 
   lines.push(boxBottom(width));
   return lines;
@@ -3684,8 +3907,8 @@ function ageDimColor(session, now) {
 /** Model column color: muted orange for Anthropic, muted blue for OpenAI */
 function modelColor(session) {
   const m = (session.model || "").toLowerCase();
-  if (m.startsWith("claude")) return "\x1b[38;5;173m"; // muted orange
-  if (m.startsWith("gpt") || m.startsWith("o1") || m.startsWith("o3") || m.startsWith("o4")) return "\x1b[38;5;110m"; // muted blue
+  if (m.startsWith("claude")) return C.modelClaude;
+  if (m.startsWith("gpt") || m.startsWith("o1") || m.startsWith("o3") || m.startsWith("o4")) return C.modelCodex;
   return C.dimText;
 }
 
@@ -3777,7 +4000,7 @@ function renderSessionRow(session, index, isSelected, width, now, hScroll, state
 function renderFooter(state, width) {
   const items = [
     ["F1", "Help", "f1"], ["F3", "Filter", "f3"], ["F5", "Refresh", "f5"],
-    ["F6", "SortBy", "f6"], ["F7", "Age", "f7"], ["Tab", "Panel", "tab"], ["`", "Live", "backtick"], ["d", "Delete", "d_delete"], ["F10", "Quit", "f10"],
+    ["F6", "SortBy", "f6"], ["F7", "Age", "f7"], ["Tab", "Panel", "tab"], ["`", "Live", "backtick"], ["t", "Theme", "t_theme"], ["d", "Delete", "d_delete"], ["F10", "Quit", "f10"],
   ];
   let line = "";
   state._footerItems = [];
@@ -3795,9 +4018,9 @@ function renderFooter(state, width) {
     const label = { "1d": "1 day", "1w": "1 week", "1mo": "1 month" }[state.inactivityFilter] || state.inactivityFilter;
     const chunk = " Age: <" + label + " ✕ ";
     if (remaining >= chunk.length) {
-      line += "\x1b[1;38;5;179m" + " Age: <" + label + " " + RESET;
+      line += C.ageLabel + " Age: <" + label + " " + RESET;
       const beforeAgeX = line.replace(/\x1b\[[^m]*m/g, "").length;
-      const ageXStyle = state._hoverAgeX ? "\x1b[1;4;38;5;203m" : "\x1b[38;5;167m";
+      const ageXStyle = state._hoverAgeX ? C.filterXHover : C.filterX;
       line += ageXStyle + "✕" + RESET + " ";
       state._ageFilterXCol = beforeAgeX + 1;
       remaining -= chunk.length;
@@ -3810,7 +4033,7 @@ function renderFooter(state, width) {
     if (remaining >= chunk.length) {
       line += C.searchFg + " Filter: " + state.searchQuery + " " + RESET;
       const beforeX = line.replace(/\x1b\[[^m]*m/g, "").length;
-      const xStyle = state._hoverFilterX ? "\x1b[1;4;38;5;203m" : "\x1b[38;5;167m";
+      const xStyle = state._hoverFilterX ? C.filterXHover : C.filterX;
       line += xStyle + "✕" + RESET + " ";
       state._filterXCol = beforeX + 1;
       remaining -= chunk.length;
@@ -3994,9 +4217,9 @@ function renderBottomPanels(session, data, plan, width, panelHeight, activeTab, 
     if (i === activeTab) {
       topLine += C.panelTitle + name + RESET;
     } else if (i === hoverTab) {
-      topLine += "\x1b[4;38;5;179m" + name + RESET; // underline amber on hover
+      topLine += C.tabHover + name + RESET;
     } else {
-      topLine += "\x1b[38;5;245m" + name + RESET;
+      topLine += C.tabInactive + name + RESET;
     }
   }
   topLine += " ";
@@ -4004,22 +4227,21 @@ function renderBottomPanels(session, data, plan, width, panelHeight, activeTab, 
   topLine += bc + BOX.h.repeat(remaining) + BOX.tr + RESET;
 
   // --- Underline rule: bright under active tab, dim elsewhere ---
-  const dimRule = "\x1b[38;5;238m";
-  let ruleLine = bc + BOX.v + RESET + dimRule + "──" + RESET;
+  let ruleLine = bc + BOX.v + RESET + C.tabRuleDim + "──" + RESET;
   for (let i = 0; i < BOTTOM_TABS.length; i++) {
-    if (i > 0) ruleLine += dimRule + "──" + RESET;
+    if (i > 0) ruleLine += C.tabRuleDim + "──" + RESET;
     const name = BOTTOM_TABS[i];
     if (i === activeTab) {
       ruleLine += C.borderHi + "━".repeat(name.length) + RESET;
     } else if (i === hoverTab) {
-      ruleLine += "\x1b[38;5;245m" + "━".repeat(name.length) + RESET; // subtle underline on hover
+      ruleLine += C.tabRuleHover + "━".repeat(name.length) + RESET;
     } else {
-      ruleLine += dimRule + "─".repeat(name.length) + RESET;
+      ruleLine += C.tabRuleDim + "─".repeat(name.length) + RESET;
     }
   }
-  ruleLine += dimRule + "─" + RESET;
+  ruleLine += C.tabRuleDim + "─" + RESET;
   const ruleRemain = Math.max(0, width - labelsEnd - 2);
-  ruleLine += dimRule + "─".repeat(ruleRemain) + RESET + bc + BOX.v + RESET;
+  ruleLine += C.tabRuleDim + "─".repeat(ruleRemain) + RESET + bc + BOX.v + RESET;
 
   // --- Content ---
   let contentLines;
@@ -4084,10 +4306,10 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows) {
 
   // ── Identity ──
   const displayModel = data.lastModel || session.model || (data.models || [data.model])[0] || "?";
-  const provColor = session.provider === "claude" ? "\x1b[38;5;173m" : "\x1b[38;5;110m";
+  const provColor = session.provider === "claude" ? C.modelClaude : C.modelCodex;
   const ml = displayModel.toLowerCase();
-  const mdlColor = ml.startsWith("claude") ? "\x1b[38;5;173m"
-    : (ml.startsWith("gpt") || ml.startsWith("o1") || ml.startsWith("o3") || ml.startsWith("o4")) ? "\x1b[38;5;110m"
+  const mdlColor = ml.startsWith("claude") ? C.modelClaude
+    : (ml.startsWith("gpt") || ml.startsWith("o1") || ml.startsWith("o3") || ml.startsWith("o4")) ? C.modelCodex
     : C.hdrValue;
   lines.push(`${C.hdrLabel}Type${RESET}       ${provColor}${prov}${RESET}  ${C.hdrLabel}Model${RESET} ${mdlColor}${displayModel}${RESET}`);
   addCopyLine("ID", shortSid, sid, "id", 9);
@@ -4313,7 +4535,7 @@ function renderCostPanel(session, data, plan, panelW, rows, scrollTop, state) {
     const plain = (line || "").replace(/\x1b\[[^m]*m/g, "");
     return (line || "") + " ".repeat(Math.max(0, w - plain.length));
   };
-  const divider = "\x1b[38;5;238m│\x1b[0m ";
+  const divider = "\x1b[38;5;238m│" + RESET + " ";
   for (let i = 0; i < totalL; i++) {
     allLines.push(padTo(leftLines[i] || "", sepCol) + divider + (rightLines[i] || ""));
   }
@@ -4346,10 +4568,10 @@ function renderCostPanel(session, data, plan, panelW, rows, scrollTop, state) {
     const isThumb = r >= thumbStart && r < thumbEnd;
     const padded = ansiSlice(line, 0, contentW);
     if (isThumb) {
-      const color = (state._costScrollbarHover || state._costScrollbarDrag) ? "\x1b[1;38;5;255m" : "\x1b[38;5;245m";
+      const color = (state._costScrollbarHover || state._costScrollbarDrag) ? C.arrowHover : C.scrollThumb;
       return padded + color + "┃" + RESET;
     }
-    return padded + "\x1b[38;5;238m│" + RESET;
+    return padded + C.scrollTrack + "│" + RESET;
   });
 }
 
@@ -4620,13 +4842,13 @@ function renderAgentPanel(session, data, panelW, rows, state) {
 
     if (isUpArrow) {
       const isHoverArrow = state._hoverAgentArrow === "up";
-      const arrowStyle = isHoverArrow ? "\x1b[1;38;5;255m" : C.dimText;
+      const arrowStyle = isHoverArrow ? C.arrowHover : C.dimText;
       const arrow = arrowStyle + " ".repeat(Math.floor(AGENT_TAB_WIDTH / 2) - 1) + "▲" + RESET;
       line += arrow + " ".repeat(Math.max(0, AGENT_TAB_WIDTH - Math.floor(AGENT_TAB_WIDTH / 2)));
       state._agentUpArrowRow = r;
     } else if (isDownArrow) {
       const isHoverArrow = state._hoverAgentArrow === "down";
-      const arrowStyle = isHoverArrow ? "\x1b[1;38;5;255m" : C.dimText;
+      const arrowStyle = isHoverArrow ? C.arrowHover : C.dimText;
       const arrow = arrowStyle + " ".repeat(Math.floor(AGENT_TAB_WIDTH / 2) - 1) + "▼" + RESET;
       line += arrow + " ".repeat(Math.max(0, AGENT_TAB_WIDTH - Math.floor(AGENT_TAB_WIDTH / 2)));
       state._agentDownArrowRow = r;
@@ -4649,16 +4871,16 @@ function renderAgentPanel(session, data, panelW, rows, state) {
       const pad = " ".repeat(Math.max(0, maxNameLen - trimName.length));
 
       // Count style: flash bright when count changes
-      const countStyle = isFlashing ? "\x1b[1;38;5;114m" : C.hdrDim;
+      const countStyle = isFlashing ? C.toolFlash : C.hdrDim;
 
       if (isActive) {
-        const nameStyle = hasRecentActivity ? "\x1b[1;38;5;114m" : "\x1b[1;38;5;255m";
+        const nameStyle = hasRecentActivity ? C.toolActiveActivity : C.toolActive;
         line += " " + nameStyle + trimName + RESET + pad + " " + countStyle + countStr + RESET + " ";
       } else if (isHover) {
-        const nameStyle = hasRecentActivity ? "\x1b[4;38;5;114m" : "\x1b[4;38;5;250m";
+        const nameStyle = hasRecentActivity ? C.toolHoverActivity : C.toolHover;
         line += " " + nameStyle + trimName + RESET + pad + " " + countStyle + countStr + RESET + " ";
       } else {
-        const nameStyle = hasRecentActivity ? "\x1b[38;5;114m" : "\x1b[38;5;245m";
+        const nameStyle = hasRecentActivity ? C.toolInactiveActivity : C.toolInactive;
         line += " " + nameStyle + trimName + RESET + pad + " " + countStyle + countStr + RESET + " ";
       }
 
@@ -4673,7 +4895,7 @@ function renderAgentPanel(session, data, panelW, rows, state) {
     if (isActiveSep) {
       line += C.borderHi + "┃" + RESET;
     } else {
-      line += "\x1b[38;5;238m│" + RESET;
+      line += C.toolSep + "│" + RESET;
     }
 
     // --- Header row (first content row) ---
@@ -4682,8 +4904,8 @@ function renderAgentPanel(session, data, panelW, rows, state) {
       const btnInner = liveOn ? "● Live" : "○ Live";
       const btnInnerLen = btnInner.length;
       const btn = liveOn
-        ? "\x1b[1;38;5;114m[" + RESET + "\x1b[1;38;5;16;48;5;114m " + btnInner + " " + RESET + "\x1b[1;38;5;114m]" + RESET
-        : "\x1b[38;5;245m[ " + btnInner + " ]" + RESET;
+        ? C.liveActive + "[" + RESET + C.liveBtnFg + C.liveBtnBg + " " + btnInner + " " + RESET + C.liveActive + "]" + RESET
+        : C.liveInactive + "[ " + btnInner + " ]" + RESET;
       const btnLen = btnInnerLen + 4;
       const pad = Math.max(0, contentW - btnLen);
       line += " ".repeat(pad) + btn;
@@ -4720,7 +4942,7 @@ function renderAgentPanel(session, data, panelW, rows, state) {
 
       // Copy icon on the right
       const copyFlash = state._agentCopyFlash === ci && state._agentCopyFlashTs && (now - state._agentCopyFlashTs < 1500);
-      const icon = copyFlash ? `\x1b[38;5;114m✓${RESET}` : `\x1b[38;5;60m⧉${RESET}`;
+      const icon = copyFlash ? `${C.copyFlash}✓${RESET}` : `${C.copyIcon}⧉${RESET}`;
       const copyValue = typeof entry === "string" ? entry : (entry.full || entry.d || "");
       state._agentCopyTargets.push({ row: r, value: copyValue });
 
@@ -4755,7 +4977,7 @@ function renderAgentPanel(session, data, panelW, rows, state) {
     if (hasScrollbar) {
       const trackPos = r - 1; // 0-based track position
       const isThumb = trackPos >= sbThumbStart && trackPos < sbThumbEnd;
-      line += isThumb ? "\x1b[38;5;245m┃" + RESET : "\x1b[38;5;238m│" + RESET;
+      line += isThumb ? C.scrollThumb + "┃" + RESET : C.scrollTrack + "│" + RESET;
     }
 
     lines.push(line);
@@ -4851,7 +5073,7 @@ function renderConfigPanel(session, panelW, rows, state) {
       const isHover = r === state.configSubTabHover;
       // Copy icon (⧉) at the end of the label
       const copyFlash = state._configCopyFlash === r && state._configCopyFlashTs && (now - state._configCopyFlashTs < 1500);
-      const icon = copyFlash ? `\x1b[38;5;114m✓${RESET}` : `\x1b[38;5;60m⧉${RESET}`;
+      const icon = copyFlash ? `${C.copyFlash}✓${RESET}` : `${C.copyIcon}⧉${RESET}`;
       const maxLabelLen = CONFIG_TAB_WIDTH - 4; // space + label + space + icon + space
       const trimLabel = label.length > maxLabelLen ? label.slice(0, maxLabelLen) : label;
       const pad = " ".repeat(Math.max(0, maxLabelLen - trimLabel.length));
@@ -4873,7 +5095,7 @@ function renderConfigPanel(session, panelW, rows, state) {
     if (r < sections.length && r === state.configSubTab) {
       line += C.borderHi + "┃" + RESET;
     } else {
-      line += "\x1b[38;5;238m" + "│" + RESET;
+      line += C.toolSep + "│" + RESET;
     }
 
     // --- Content ---
@@ -4888,10 +5110,10 @@ function renderConfigPanel(session, panelW, rows, state) {
       const isThumb = r >= thumbStart && r < thumbEnd;
       const isScrollHover = state._configScrollbarHover && r >= thumbStart && r < thumbEnd;
       if (isThumb) {
-        const color = (isScrollHover || state._configScrollbarDrag) ? "\x1b[1;38;5;255m" : "\x1b[38;5;245m";
+        const color = (isScrollHover || state._configScrollbarDrag) ? C.arrowHover : C.scrollThumb;
         line = ansiSlice(line, 0, padTo) + color + "┃" + RESET;
       } else {
-        line = ansiSlice(line, 0, padTo) + "\x1b[38;5;238m" + "│" + RESET;
+        line = ansiSlice(line, 0, padTo) + C.scrollTrack + "│" + RESET;
       }
     }
 
@@ -4933,6 +5155,7 @@ function renderHelpView(width, height) {
   lines.push("    /, F3            Filter sessions by text");
   lines.push("    F7               Filter sessions by age (1d / 1w / 1mo)");
   lines.push("    d                Delete selected session (not running)");
+  lines.push("    t                Toggle color theme (default / sysdig)");
   lines.push("    F5, r            Refresh session data");
   lines.push("    F1, ?, h         Show this help");
   lines.push("    q, F10           Quit");
@@ -4990,10 +5213,10 @@ function deleteSession(session) {
 function renderDeleteConfirm(session, width) {
   const modalW = Math.min(60, width - 6);
   const boxLeft = Math.floor((width - modalW) / 2);
-  const border = "\x1b[38;5;196;48;5;52m"; // red on dark-red
-  const labelC = "\x1b[1;38;5;203;48;5;52m";
-  const pathC = "\x1b[38;5;252;48;5;52m";
-  const hintC = "\x1b[38;5;245;48;5;52m";
+  const border = C.deleteBorder;
+  const labelC = C.deleteLabel;
+  const pathC = C.deletePath;
+  const hintC = C.deleteHint;
   const inner = modalW - 2;
 
   const title = " Delete session? ";
@@ -5130,10 +5353,10 @@ function renderInactivityModal(state, width) {
     const opt = INACTIVITY_OPTIONS[i];
     const isActive = state.inactivityFilter === opt.key;
     const isCursor = state._inactivityCursor === i;
-    const checkC = isActive ? "\x1b[1;38;5;114m" : "\x1b[38;5;240m";
+    const checkC = isActive ? C.checkActive : C.checkInactive;
     const check = checkC + (isActive ? "●" : "○") + RESET;
-    const textC = isCursor ? "\x1b[1;38;5;255;48;5;238m" : (isActive ? "\x1b[38;5;252m" : "\x1b[38;5;245m");
-    const bg    = isCursor ? "\x1b[48;5;238m" : "";
+    const textC = isCursor ? C.cursorText : (isActive ? C.normalFg : C.dimText);
+    const bg    = isCursor ? C.cursorBg : "";
     const rowInner = bg + padTo(" " + check + " " + textC + opt.label + RESET + bg, inner) + RESET;
     lines.push(row(rowInner));
   }
@@ -5173,11 +5396,11 @@ function renderListTabBar(state, width) {
   topLine += C.hdrLabel + title + RESET + " ";
   topLine += bc + BOX.h.repeat(fillerLen) + RESET + " ";
   if (isLive) {
-    topLine += "\x1b[1;38;5;114m" + liveLabel + RESET;
+    topLine += C.liveActive + liveLabel + RESET;
   } else if (state._liveHover) {
-    topLine += "\x1b[4;38;5;179m" + liveLabel + RESET;
+    topLine += C.liveHover + liveLabel + RESET;
   } else {
-    topLine += "\x1b[38;5;245m" + liveLabel + RESET;
+    topLine += C.liveInactive + liveLabel + RESET;
   }
   topLine += " " + bc + BOX.tr + RESET;
 
@@ -5202,11 +5425,12 @@ function render(state) {
   const width = process.stdout.columns || 100;
   const height = process.stdout.rows || 24;
   let buf = SYNC_START + "\x1b[H"; // move cursor to top-left
+  const bg = _themeBg; // per-frame background (empty string for default theme)
 
   if (state.mode === "help") {
     const lines = renderHelpView(width, height);
-    for (const line of lines) buf += line + "\x1b[K\n";
-    buf += renderFooter(state, width);
+    for (const line of lines) buf += bg + line + bg + "\x1b[K" + RESET + "\n";
+    buf += bg + renderFooter(state, width) + bg + "\x1b[K" + RESET;
     buf += SYNC_END;
     process.stdout.write(buf);
     return;
@@ -5215,8 +5439,8 @@ function render(state) {
   if (state.mode === "detail") {
     const plan = state.detailSession.provider === "codex" ? state.codexPlan : state.claudePlan;
     const lines = renderDetailView(state.detailSession, state.detailData, plan, width, height);
-    for (const line of lines) buf += line + "\x1b[K\n";
-    buf += renderFooter(state, width);
+    for (const line of lines) buf += bg + line + bg + "\x1b[K" + RESET + "\n";
+    buf += bg + renderFooter(state, width) + bg + "\x1b[K" + RESET;
     buf += SYNC_END;
     process.stdout.write(buf);
     return;
@@ -5427,11 +5651,12 @@ function render(state) {
   }
 
   // Write all lines
-  for (const line of screenLines) buf += line + "\x1b[K\n";
+  const lineReset = _themeBg ? RESET : "";
+  for (const line of screenLines) buf += bg + line + bg + "\x1b[K" + lineReset + "\n";
 
   // Footer
   state._footerRow = screenLines.length + 1; // 1-based
-  buf += renderFooter(state, width);
+  buf += bg + renderFooter(state, width) + bg + "\x1b[K" + lineReset;
   buf += SYNC_END;
   process.stdout.write(buf);
 }
@@ -5812,6 +6037,13 @@ function handleEvent(event, state) {
         case "4": state.bottomTab = 3; state.dirty = true; saveUiPrefs({ bottomTab: 3, listTab: state.listTab }); return;
         case "5": state.bottomTab = 4; state.dirty = true; saveUiPrefs({ bottomTab: 4, listTab: state.listTab }); return;
         case "`": switchListTab(state); return;
+        case "t": {
+          state.theme = state.theme === "sysdig" ? "default" : "sysdig";
+          applyTheme(state.theme);
+          saveUiPrefs({ theme: state.theme });
+          state.dirty = true;
+          return;
+        }
         default: return;
       }
       break; // fall through for remapped keys (k->up, j->down, l->enter)
@@ -6631,6 +6863,10 @@ async function main() {
     state.inactivityFilter = _savedPrefs.inactivityFilter || null;
     const idx = INACTIVITY_OPTIONS.findIndex(o => o.key === state.inactivityFilter);
     state._inactivityCursor = idx >= 0 ? idx : INACTIVITY_OPTIONS.length - 1;
+  }
+  if (_savedPrefs.theme && THEMES[_savedPrefs.theme]) {
+    state.theme = _savedPrefs.theme;
+    applyTheme(state.theme);
   }
   if (Array.isArray(_savedPrefs.tabSort)) {
     for (let i = 0; i < _savedPrefs.tabSort.length && i < state._tabSort.length; i++) {
