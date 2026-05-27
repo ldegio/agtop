@@ -2048,6 +2048,13 @@ async function annotateListCosts(sessions, plan) {
       } else if (data) {
         session.list_total_cost = data.costs.total;
       }
+      // Subagents (for list-row expansion)
+      if (data && Array.isArray(data.subagents)) {
+        session.list_subagents = data.subagents;
+        session.list_subagents_count = data.subagents.length;
+        session.list_subagents_cost = data.subagents.reduce(
+          (sum, sa) => sum + (typeof sa.cost === "number" ? sa.cost : Number(sa.cost) || 0), 0);
+      }
     })
   );
 }
@@ -3610,6 +3617,8 @@ function createState() {
     _costDragStartScroll: 0,
     configScroll: 0, // scroll offset in Config panel content
     subagentScroll: 0, // scroll offset in Subagents panel
+    expandedSubagents: new Set(), // session keys ("provider:session_id") with subagents expanded in the list
+    flatList: [],     // virtual rows: [{type:"session"|"marker"|"subagent", session, subagent?, expanded?}]
     configSubTabHover: -1, // hover over config sub-tab
     _configPanelTop: 0, // 1-based row of first content row in config panel
     _configCopyTargets: [], // [{row, copyPath}]
@@ -3797,8 +3806,53 @@ function applySortAndFilter(state) {
   state.filtered = list;
   state.stats = computeStats(state.sessions);
 
-  // Clamp selection
-  if (state.selectedRow >= list.length) state.selectedRow = Math.max(0, list.length - 1);
+  // Rebuild the virtual (flat) list of rows that the UI iterates over: sessions
+  // plus expansion markers and subagent children when a session is expanded.
+  state.flatList = buildFlatList(state);
+
+  // Clamp selection against virtual-row count
+  if (state.selectedRow >= state.flatList.length) state.selectedRow = Math.max(0, state.flatList.length - 1);
+}
+
+/** Unique key for the expandedSubagents set; same shape used as session map keys. */
+function sessionKey(s) {
+  return `${s.provider}:${s.session_id}`;
+}
+
+/** Build the virtual row list: each session, plus a marker + child rows when expanded. */
+function buildFlatList(state) {
+  const flat = [];
+  const expanded = state.expandedSubagents || new Set();
+  for (const s of state.filtered) {
+    flat.push({ type: "session", session: s });
+    const subs = Array.isArray(s.list_subagents) ? s.list_subagents : null;
+    if (subs && subs.length > 0) {
+      const isExpanded = expanded.has(sessionKey(s));
+      flat.push({ type: "marker", session: s, expanded: isExpanded, count: subs.length });
+      if (isExpanded) {
+        const sorted = subs.slice().sort((a, b) => {
+          if (a.status !== b.status) return a.status === "running" ? -1 : 1;
+          return (b.started_at || "").localeCompare(a.started_at || "");
+        });
+        for (const sa of sorted) flat.push({ type: "subagent", session: s, subagent: sa });
+      }
+    }
+  }
+  return flat;
+}
+
+/** Return the session that "owns" the selected row (parent for marker/subagent). */
+function getSelectedSession(state) {
+  const row = state.flatList[state.selectedRow];
+  return row ? row.session : null;
+}
+
+/** Find the flat-list index of the session row that owns the given flat-list row index. */
+function findParentSessionIndex(state, flatIdx) {
+  for (let i = flatIdx; i >= 0; i--) {
+    if (state.flatList[i] && state.flatList[i].type === "session") return i;
+  }
+  return -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -4174,6 +4228,68 @@ function renderSessionRow(session, index, isSelected, width, now, hScroll, state
     if (!col.flex && used < totalW) { line += " "; used++; }
   }
 
+  return base + ansiSlice(line, hScroll, width) + RESET;
+}
+
+/** Dispatch one virtual row (session, marker, or subagent) to the appropriate renderer. */
+function renderFlatRow(row, index, isSelected, width, now, hScroll, state) {
+  if (!row) return "";
+  if (row.type === "session") {
+    return renderSessionRow(row.session, index, isSelected, width, now, hScroll, state);
+  }
+  if (row.type === "marker") {
+    return renderSubagentMarkerRow(row.session, row.expanded, row.count, isSelected, width, hScroll, state);
+  }
+  if (row.type === "subagent") {
+    return renderSubagentChildRow(row.subagent, isSelected, width, hScroll, state);
+  }
+  return "";
+}
+
+/** Indented "▶ N subagents ($X.XX)" marker shown beneath a session that has subagents. */
+function renderSubagentMarkerRow(session, expanded, count, isSelected, width, hScroll, state) {
+  const bg = isSelected ? C.selBg : "";
+  const fg = isSelected ? C.selFg : "";
+  const base = bg + fg;
+  const chev = expanded ? "▼" : "▶";
+  const cost = typeof session.list_subagents_cost === "number"
+    ? "$" + session.list_subagents_cost.toFixed(2)
+    : null;
+  const ghosts = (session.list_subagents || []).filter(s => s.ghost).length;
+  const ghostNote = ghosts > 0 ? `  ${ghosts} purged` : "";
+  const label = `  └${chev} ${count} subagent${count === 1 ? "" : "s"}${cost ? `  (${cost})` : ""}${ghostNote}`;
+  const text = label.length > width - 2 ? label.slice(0, width - 3) + "…" : label;
+  const color = isSelected ? "" : C.dimText;
+  const line = base + color + text + RESET + base;
+  return base + ansiSlice(line, hScroll, width) + RESET;
+}
+
+/** Indented child row for a single subagent under an expanded session. */
+function renderSubagentChildRow(sa, isSelected, width, hScroll, state) {
+  const bg = isSelected ? C.selBg : "";
+  const fg = isSelected ? C.selFg : "";
+  const base = bg + fg;
+  const isGhost = sa.ghost === true;
+  const isRunning = sa.status === "running";
+  const icon = isGhost ? "◌" : (isRunning ? "●" : "○");
+  const iconColor = isSelected ? "" : (isGhost ? C.dimText : (isRunning ? C.chartBarHi : C.dimText));
+  const ts = sa.started_at ? new Date(sa.started_at) : null;
+  const startStr = (ts && !isNaN(ts.getTime()))
+    ? String(ts.getHours()).padStart(2, "0") + ":" + String(ts.getMinutes()).padStart(2, "0")
+    : "  —  ".slice(0, 5);
+  const cost = (isGhost || typeof sa.cost !== "number")
+    ? "  —  "
+    : ("$" + sa.cost.toFixed(2)).padStart(7);
+  const tools = (isGhost ? "  —" : String(sa.tool_count || 0).padStart(3));
+  const desc = sa.description || "(no description)";
+  const model = (sa.model || "?").replace(/^claude-/, "").replace(/-\d{8}$/, "");
+  // Layout: "     ◌ 10:18  $0.42  142  haiku-4-5  Implement Task 1"
+  const prefix = `     ${icon} ${startStr}  ${cost}  ${tools}  ${(model.length > 12 ? model.slice(0, 11) + "…" : model).padEnd(12)}  `;
+  const maxDesc = Math.max(8, width - 2 - prefix.replace(/\x1b\[[^m]*m/g, "").length);
+  const descShort = desc.length > maxDesc ? desc.slice(0, maxDesc - 1) + "…" : desc;
+  const rowColor = isSelected ? "" : (isGhost ? C.dimText : "\x1b[38;5;250m");
+  const line = base + " ".repeat(5) + (iconColor || "") + icon + RESET + base +
+    rowColor + ` ${startStr}  ${cost}  ${tools}  ${(model.length > 12 ? model.slice(0, 11) + "…" : model).padEnd(12)}  ${descShort}` + RESET + base;
   return base + ansiSlice(line, hScroll, width) + RESET;
 }
 
@@ -6100,7 +6216,10 @@ function render(state) {
   // List area = boxTop(1) + colHeader(1) + rows + boxBottom(1)
   const listHeight = Math.max(1, listAreaH - 3);
   const now = new Date();
-  const list = state.filtered;
+  // Recompute the virtual row list (sessions + markers + expanded children) every render
+  // so changes to filtered/sorted sessions or expansion state are picked up.
+  state.flatList = buildFlatList(state);
+  const flat = state.flatList;
 
   // Adjust scroll to keep selection visible
   if (state.selectedRow < state.scrollOffset) {
@@ -6116,7 +6235,7 @@ function render(state) {
   state._colHeaderRow = screenLines.length + 1; // 1-based row of column header
   screenLines.push(renderColumnHeaders(state, boxW));
 
-  if (list.length === 0 && state.listTab === 1) {
+  if (state.filtered.length === 0 && state.listTab === 1) {
     // Empty Live tab
     const emptyMsg = C.dimText + "  No active sessions running" + RESET;
     screenLines.push(emptyMsg);
@@ -6124,9 +6243,9 @@ function render(state) {
   } else {
     for (let i = 0; i < listHeight; i++) {
       const idx = state.scrollOffset + i;
-      if (idx < list.length) {
+      if (idx < flat.length) {
         const isSelected = idx === state.selectedRow;
-        screenLines.push(renderSessionRow(list[idx], idx, isSelected, boxW, now, state.hScroll, state));
+        screenLines.push(renderFlatRow(flat[idx], idx, isSelected, boxW, now, state.hScroll, state));
       } else {
         screenLines.push("");
       }
@@ -6134,8 +6253,8 @@ function render(state) {
   }
   screenLines.push(boxBottom(boxW));
 
-  // Bottom detail panels (tabbed)
-  const selected = list[state.selectedRow] || null;
+  // Bottom detail panels (tabbed) — the session that "owns" the selected virtual row
+  const selected = getSelectedSession(state);
   const panelPlan = selected ? (selected.provider === "codex" ? state.codexPlan : state.claudePlan) : null;
   state._tabBarRow = screenLines.length + 1; // 1-based row of the tab bar
   state._configPanelTop = screenLines.length + 3; // 1-based: tab bar + rule line → first content row
@@ -6199,7 +6318,7 @@ function render(state) {
 
   // Overlay delete confirmation
   if (state.mode === "delete") {
-    const sel = state.filtered[state.selectedRow];
+    const sel = getSelectedSession(state);
     if (sel) {
       const dm = renderDeleteConfirm(sel, width);
       const startRow = Math.max(0, Math.floor((screenLines.length - dm.lines.length) / 2));
@@ -6222,7 +6341,7 @@ function render(state) {
 
   // Overlay delete-blocked modal (live session)
   if (state.mode === "delete_live") {
-    const sel = state.filtered[state.selectedRow];
+    const sel = getSelectedSession(state);
     if (sel) {
       const dm = renderDeleteLiveBlocked(sel, width);
       const startRow = Math.max(0, Math.floor((screenLines.length - dm.lines.length) / 2));
@@ -6644,7 +6763,7 @@ function handleEvent(event, state) {
       state.mode = "list"; state.dirty = true; return;
     }
     if (event.type === "char" && event.char === "y") {
-      const sel = state.filtered[state.selectedRow];
+      const sel = getSelectedSession(state);
       if (sel) {
         deleteSession(sel);
         // Remove from sessions list and refilter
@@ -6666,7 +6785,7 @@ function handleEvent(event, state) {
   }
 
   // --- List mode ---
-  const listLen = state.filtered.length;
+  const listLen = (state.flatList && state.flatList.length) || state.filtered.length;
   const bodyHeight = Math.max(1, (process.stdout.rows || 24) - (state.headerLines + 2));
 
   switch (event.type) {
@@ -6687,7 +6806,7 @@ function handleEvent(event, state) {
         case "<": openSortBy(state); return;
         case "r": state._needsRefresh = true; return;
         case "d": {
-          const sel = state.filtered[state.selectedRow];
+          const sel = getSelectedSession(state);
           if (sel && sel.process) { state.mode = "delete_live"; state.dirty = true; }
           else if (sel) { state.mode = "delete"; state.dirty = true; }
           return;
@@ -6723,6 +6842,47 @@ function handleEvent(event, state) {
       state._inactivityCursor = idx >= 0 ? idx : INACTIVITY_OPTIONS.length - 1;
       state.mode = "inactivity"; state.dirty = true; return;
     }
+  }
+
+  // Subagent expansion (Right expands on session/marker, Left collapses)
+  const flatRow = state.flatList && state.flatList[state.selectedRow];
+  if (event.type === "right" && flatRow) {
+    if ((flatRow.type === "session" || flatRow.type === "marker")) {
+      const s = flatRow.session;
+      const hasSubs = Array.isArray(s.list_subagents) && s.list_subagents.length > 0;
+      if (hasSubs && !state.expandedSubagents.has(sessionKey(s))) {
+        state.expandedSubagents.add(sessionKey(s));
+        state.flatList = buildFlatList(state);
+        state.dirty = true;
+        return;
+      }
+    }
+  }
+  if (event.type === "left" && flatRow) {
+    if (flatRow.type === "subagent" || flatRow.type === "marker" || flatRow.type === "session") {
+      const s = flatRow.session;
+      if (state.expandedSubagents.has(sessionKey(s))) {
+        state.expandedSubagents.delete(sessionKey(s));
+        // Move selection up to the parent session row (it may have moved indexes after collapse)
+        state.flatList = buildFlatList(state);
+        const parentIdx = state.flatList.findIndex(r => r.type === "session" && r.session === s);
+        if (parentIdx >= 0) state.selectedRow = parentIdx;
+        state.dirty = true;
+        return;
+      }
+    }
+  }
+  // Enter on a marker toggles the expansion of its parent
+  if (event.type === "enter" && flatRow && flatRow.type === "marker") {
+    const s = flatRow.session;
+    if (state.expandedSubagents.has(sessionKey(s))) {
+      state.expandedSubagents.delete(sessionKey(s));
+    } else {
+      state.expandedSubagents.add(sessionKey(s));
+    }
+    state.flatList = buildFlatList(state);
+    state.dirty = true;
+    return;
   }
 
   // Navigation
@@ -6845,7 +7005,7 @@ function handleEvent(event, state) {
               case "f6": openSortBy(state); break;
               case "tab": cycleBottomTab(state, 1); break;
               case "backtick": switchListTab(state); break;
-              case "d_delete": { const sel = state.filtered[state.selectedRow]; if (sel && !sel.process) { state.mode = "delete"; state.dirty = true; } break; }
+              case "d_delete": { const sel = getSelectedSession(state); if (sel && !sel.process) { state.mode = "delete"; state.dirty = true; } break; }
               case "f7": { const idx = INACTIVITY_OPTIONS.findIndex(o => o.key === state.inactivityFilter); state._inactivityCursor = idx >= 0 ? idx : INACTIVITY_OPTIONS.length - 1; state.mode = "inactivity"; state.dirty = true; break; }
               case "f10": state.quit = true; break;
             }
@@ -6874,7 +7034,7 @@ function handleEvent(event, state) {
       }
       // Check if click is on a copy icon (⧉) in the Info panel
       if (state.bottomTab === 0 && state._tabBarRow) {
-        const selected = state.filtered[state.selectedRow];
+        const selected = getSelectedSession(state);
         if (selected && selected._copyTargets) {
           for (const target of selected._copyTargets) {
             const screenRow = state._tabBarRow + 2 + target.line; // +2 for tab bar + rule
@@ -7021,7 +7181,7 @@ function handleEvent(event, state) {
       // Check if click is in Config panel area
       if (state.bottomTab === 5 && state._configPanelTop && event.row >= state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
-        const selected = state.filtered[state.selectedRow];
+        const selected = getSelectedSession(state);
         const sections = getSessionConfig(selected);
         const sb = state._configScrollbar;
         // Click on scrollbar
@@ -7074,11 +7234,20 @@ function handleEvent(event, state) {
         const colKey = columnAtX(event.col, state.hScroll, state);
         if (colKey) setSortColumn(state, colKey);
       } else if (state._colHeaderRow && event.row > state._colHeaderRow) {
-        // Click on session row
+        // Click on a virtual row (session, marker, or subagent)
         const rowIdx = state.scrollOffset + (event.row - state._colHeaderRow - 1);
         if (rowIdx >= 0 && rowIdx < listLen) {
+          // Same-row click on a marker toggles expansion; otherwise just selects.
+          const wasSelected = rowIdx === state.selectedRow;
           state.selectedRow = rowIdx;
           state.dirty = true;
+          const r = state.flatList[rowIdx];
+          if (r && r.type === "marker" && wasSelected) {
+            const s = r.session;
+            if (state.expandedSubagents.has(sessionKey(s))) state.expandedSubagents.delete(sessionKey(s));
+            else state.expandedSubagents.add(sessionKey(s));
+            state.flatList = buildFlatList(state);
+          }
         }
       }
       return;
@@ -7125,7 +7294,7 @@ function handleEvent(event, state) {
       }
       if (state.bottomTab === 5 && state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
-        const selected = state.filtered[state.selectedRow];
+        const selected = getSelectedSession(state);
         const sections = getSessionConfig(selected);
         if (rowInPanel >= 0 && event.col <= CONFIG_TAB_WIDTH + 2 && rowInPanel < sections.length) {
           newConfigHover = rowInPanel;
@@ -7649,7 +7818,7 @@ async function main() {
   }
 
   // Load panel data for the initially selected session
-  const initSel = state.filtered[state.selectedRow];
+  const initSel = getSelectedSession(state);
   if (initSel) {
     state._panelSessionId = initSel.session_id;
     state.panelData = await safeExtractSessionData(initSel);
@@ -7664,7 +7833,7 @@ async function main() {
     await loadSessions(state);
     // Re-load panel data for current selection
     state._panelSessionId = null;
-    const panelSel = state.filtered[state.selectedRow];
+    const panelSel = getSelectedSession(state);
     if (panelSel) {
       state._panelSessionId = panelSel.session_id;
       state.panelData = await safeExtractSessionData(panelSel);
@@ -7717,7 +7886,7 @@ async function main() {
     }
 
     // Load panel data when selection changes
-    const panelSel = state.filtered[state.selectedRow];
+    const panelSel = getSelectedSession(state);
     if (panelSel && panelSel.session_id !== state._panelSessionId) {
       state._panelSessionId = panelSel.session_id;
       state.panelData = null; // show "Loading..." immediately
