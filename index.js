@@ -4321,15 +4321,27 @@ function renderSubagentChildRow(sa, isSelected, width, hScroll, state) {
     ? "      —"   // 7-char column, right-aligned em-dash to match $N.NN values
     : ("$" + sa.cost.toFixed(2)).padStart(7);
   const tools = (isGhost ? "    —" : String(sa.tool_count || 0).padStart(5));
+  const dur = (isGhost || !sa.duration_ms)
+    ? "     —"
+    : (() => {
+        const s = Math.round(sa.duration_ms / 1000);
+        if (s < 60)    return `${s}s`.padStart(6);
+        const m = Math.floor(s / 60);
+        const r = s % 60;
+        if (m < 60)    return `${m}m${String(r).padStart(2, "0")}s`.padStart(6);
+        const h = Math.floor(m / 60);
+        const mr = m % 60;
+        return `${h}h${String(mr).padStart(2, "0")}m`.padStart(6);
+      })();
   const desc = sa.description || "(no description)";
   const model = (sa.model || "?").replace(/^claude-/, "").replace(/-\d{8}$/, "");
-  // Layout: "     ◌ 10:18  $0.42      142  haiku-4-5     Implement Task 1"
-  const prefix = `     ${icon} ${startStr}  ${cost}  ${tools}  ${(model.length > 12 ? model.slice(0, 11) + "…" : model).padEnd(12)}  `;
+  // Layout: "     ◌ 10:18  3m12s  $0.42   142  haiku-4-5     Implement Task 1"
+  const prefix = `     ${icon} ${startStr}  ${dur}  ${cost}  ${tools}  ${(model.length > 12 ? model.slice(0, 11) + "…" : model).padEnd(12)}  `;
   const maxDesc = Math.max(8, width - 2 - prefix.replace(/\x1b\[[^m]*m/g, "").length);
   const descShort = desc.length > maxDesc ? desc.slice(0, maxDesc - 1) + "…" : desc;
   const rowColor = isSelected ? "" : (isGhost ? C.dimText : "\x1b[38;5;250m");
   const line = base + " ".repeat(5) + (iconColor || "") + icon + RESET + base +
-    rowColor + ` ${startStr}  ${cost}  ${tools}  ${(model.length > 12 ? model.slice(0, 11) + "…" : model).padEnd(12)}  ${descShort}` + RESET + base;
+    rowColor + ` ${startStr}  ${dur}  ${cost}  ${tools}  ${(model.length > 12 ? model.slice(0, 11) + "…" : model).padEnd(12)}  ${descShort}` + RESET + base;
   return base + ansiSlice(line, hScroll, width) + RESET;
 }
 
@@ -4340,8 +4352,8 @@ function renderSubagentHeaderRow(isSelected, width, hScroll, state) {
   const fg = isSelected ? C.selFg : "";
   const base = bg + fg;
   const dim = isSelected ? "" : C.dimText;
-  // 5sp indent + 1ch icon + 1sp + 5ch START + 2sp + 7ch COST + 2sp + 5ch TOOLS + 2sp + 12ch MODEL + 2sp + DESCRIPTION
-  const labels = "     " + " " + " " + "START" + "  " + "   COST" + "  " + "TOOLS" + "  " + "MODEL       " + "  " + "DESCRIPTION";
+  // 5sp indent + 1ch icon + 1sp + 5ch START + 2sp + 6ch DUR + 2sp + 7ch COST + 2sp + 5ch TOOLS + 2sp + 12ch MODEL + 2sp + DESCRIPTION
+  const labels = "     " + " " + " " + "START" + "  " + "   DUR" + "  " + "   COST" + "  " + "TOOLS" + "  " + "MODEL       " + "  " + "DESCRIPTION";
   const line = base + dim + labels + RESET + base;
   return base + ansiSlice(line, hScroll, width) + RESET;
 }
