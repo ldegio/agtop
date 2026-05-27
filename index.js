@@ -1400,9 +1400,9 @@ async function extractClaudeSessionData(transcriptPath) {
 
   const transcriptFiles = claudeTranscriptFiles(transcriptPath);
   // Per-subagent-file accumulators (one entry per non-main file)
-  const subagentStats = new Map(); // filePath → { cost, tool_count, first_ts, last_ts, last_model }
+  const subagentStats = new Map(); // filePath → { cost, tool_count, first_ts, last_ts, last_model, latest_used, latest_used_ts }
   for (const fp of transcriptFiles.slice(1)) {
-    subagentStats.set(fp, { cost: 0, tool_count: 0, first_ts: null, last_ts: null, last_model: null });
+    subagentStats.set(fp, { cost: 0, tool_count: 0, first_ts: null, last_ts: null, last_model: null, latest_used: 0, latest_used_ts: "" });
   }
   // Agent tool_use blocks in the main file and their matching tool_results (for status detection)
   const agentToolUses = new Map(); // tool_use_id → { description, subagent_type, model, ts }
@@ -1569,6 +1569,16 @@ async function extractClaudeSessionData(transcriptPath) {
           `Encountered billable Claude usage with unknown model in ${filePath}`
         );
 
+      // Track the latest cumulative context usage for this subagent (input + cache).
+      // Streaming partials share a requestId; we pick the latest-timestamped entry.
+      if (fileStats) {
+        const ts = item.timestamp || "";
+        if (!fileStats.latest_used_ts || ts >= fileStats.latest_used_ts) {
+          fileStats.latest_used = inputTokens + cacheReadTokens + totalCacheWriteTokens;
+          fileStats.latest_used_ts = ts;
+        }
+      }
+
       const key = requestKey(item, message);
       const snapshot = { inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, model, ts: item.timestamp || "" };
       if (key !== null) {
@@ -1686,6 +1696,20 @@ async function extractClaudeSessionData(transcriptPath) {
     } else {
       status = (nowMs - lastActiveMs < 30000) ? "running" : "done";
     }
+    // Per-subagent context usage: total of the latest assistant message, against
+    // the model's max input window. Subagents have their own isolated contexts
+    // independent of the parent, so we compute from the subagent's own usage.
+    // Use usage-based inference for the max (same fallback the parent uses when
+    // no project settings are pinned) — LiteLLM reports 1M for any model that
+    // *can* do 1M with the [1m] beta header, which over-estimates the window
+    // for the common 200k-default case and made some subagents show single-digit
+    // CTX% next to their parent's normal 25-50% reading on the same usage.
+    let context = null;
+    if (stats.latest_used > 0) {
+      const maxCtx = stats.latest_used > 200000 ? 1_048_576 : 200000;
+      context = { used: stats.latest_used, max: maxCtx };
+    }
+
     subagents.push({
       agent_id: agentId,
       type,
@@ -1698,6 +1722,7 @@ async function extractClaudeSessionData(transcriptPath) {
       cost: stats.cost || 0,
       tool_count: stats.tool_count || 0,
       tool_use_id: toolUseId,
+      context,
       ghost: false,
     });
   }
@@ -1779,6 +1804,7 @@ async function extractClaudeSessionData(transcriptPath) {
     _hasGhostSubagents: true, // cache bust: subagents now include ghost entries from purged transcripts
     _subagentCostNumber: true, // cache bust: subagent.cost is now a number (was a money() string)
     _subagentDescPairing: true, // cache bust: on-disk subagents without toolUseId now back-paired by description
+    _subagentContext: true,     // cache bust: per-subagent context usage added
   };
 }
 
@@ -2019,7 +2045,8 @@ async function safeExtractSessionData(session) {
   const hasGhostSubagents = cache[dKey] && cache[dKey]._hasGhostSubagents === true;
   const subagentCostNumber = cache[dKey] && cache[dKey]._subagentCostNumber === true;
   const subagentDescPairing = cache[dKey] && cache[dKey]._subagentDescPairing === true;
-  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay && hasLocalDates && hasNoSubagentModel && hasSubagentsField && hasGhostSubagents && subagentCostNumber && subagentDescPairing) {
+  const subagentContext = cache[dKey] && cache[dKey]._subagentContext === true;
+  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay && hasLocalDates && hasNoSubagentModel && hasSubagentsField && hasGhostSubagents && subagentCostNumber && subagentDescPairing && subagentContext) {
     SESSION_DATA_CACHE.set(memKey, cache[dKey]);
     SESSION_DATA_MTIME.set(memKey, effectiveMtime);
     return cache[dKey];
@@ -5663,8 +5690,9 @@ function renderSubagentsPanel(session, data, panelW, rows, state) {
   const modelW = 12;
   const costW = 7;   // up to "$999.99"
   const toolsW = 5;  // up to 99999
+  const ctxW = 4;    // "100%"
   const timeW = 7;   // "MM:SS", "Xm SSs", "Xh YYm"
-  const fixedW = startW + 1 + 1 + 1 + typeW + 1 + modelW + 1 + 1 + costW + 1 + toolsW + 1 + timeW;
+  const fixedW = startW + 1 + 1 + 1 + typeW + 1 + modelW + 1 + 1 + costW + 1 + toolsW + 1 + ctxW + 1 + timeW;
   const descW = Math.max(10, w - fixedW);
 
   const fmtStart = (ts) => {
@@ -5707,6 +5735,7 @@ function renderSubagentsPanel(session, data, panelW, rows, state) {
     hdr + truncate("DESCRIPTION", descW).padEnd(descW) + RESET + " " +
     hdr + "COST".padStart(costW) + RESET + " " +
     hdr + "TOOLS".padStart(toolsW) + RESET + " " +
+    hdr + "CTX".padStart(ctxW) + RESET + " " +
     hdr + "TIME".padStart(timeW) + RESET
   );
 
@@ -5741,6 +5770,11 @@ function renderSubagentsPanel(session, data, panelW, rows, state) {
     // Ghost rows: we don't know cost/tools/duration — show em-dash placeholders.
     const costStr  = (isGhost ? "—"  : ("$" + costNum.toFixed(2))).padStart(costW);
     const toolsStr = (isGhost ? "—"  : String(sa.tool_count || 0)).padStart(toolsW);
+    // CTX% against the model's compact threshold (same formula as the parent CTX column).
+    const ctx = sa.context;
+    const ctxStr = (isGhost || !ctx)
+      ? "—".padStart(ctxW)
+      : (Math.round((ctx.used / (ctx.max * COMPACT_THRESHOLD)) * 100) + "%").padStart(ctxW);
     const timeStr  = (isGhost ? "—"  : fmtDur(sa.duration_ms)).padStart(timeW);
 
     // Ghost rows are dimmed overall; live rows use brighter row color when running.
@@ -5754,6 +5788,7 @@ function renderSubagentsPanel(session, data, panelW, rows, state) {
       rowColor + descStr + RESET + " " +
       rowColor + costStr + RESET + " " +
       rowColor + toolsStr + RESET + " " +
+      rowColor + ctxStr + RESET + " " +
       rowColor + timeStr + RESET
     );
   }
