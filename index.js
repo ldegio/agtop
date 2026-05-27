@@ -2192,15 +2192,12 @@ function extractLastToolName(session) {
 function extractContextUsage(session) {
   if (!session || !session.data_file) return null;
   try {
-    let targetFile = session.data_file;
-    if (session.provider === "claude") {
-      const files = claudeTranscriptFiles(session.data_file);
-      let maxMt = 0;
-      for (const f of files) {
-        const mt = fileMtimeMs(f);
-        if (mt > maxMt) { maxMt = mt; targetFile = f; }
-      }
-    }
+    // Context usage is per-conversation; the parent session's CTX% must come
+    // from the parent's own jsonl. The previous logic picked whichever
+    // transcript file had the latest mtime, which meant CTX% would flip to
+    // a running subagent's context while it streamed — subagents run in their
+    // own isolated context and shouldn't shadow the parent's reading.
+    const targetFile = session.data_file;
 
     const lines = readFileTail(targetFile, 65536);
 
