@@ -2342,7 +2342,7 @@ function sparkColorSpend(ratio) {
  * Braille bits for left column: row0=0x01, row1=0x02, row2=0x04, row3=0x40
  * We use only the left column of each braille cell for 1:1 char-to-value mapping.
  */
-function renderBrailleSparkline(values, width, maxVal, colorMode) {
+function renderBrailleSparkline(values, width, maxVal, colorMode, nowIdx) {
   const colorFn = colorMode === "cpu" ? sparkColor
     : colorMode === "spend" ? sparkColorSpend
     : sparkColorAccent;
@@ -2350,6 +2350,8 @@ function renderBrailleSparkline(values, width, maxVal, colorMode) {
   const bits = [0x40, 0x04, 0x02, 0x01]; // row 3, 2, 1, 0
   const baseline = String.fromCharCode(0x2800 | 0x40); // bottom dot only
   const dimBase = (colorMode === "spend" || colorMode === "cpu") ? "\x1b[38;5;22m" : "\x1b[38;5;236m";
+  // Bright color to highlight the "now" position (current hour / day / tick).
+  const nowColor = "\x1b[1;38;5;231m"; // bold white
 
   if (!values.length) {
     return (dimBase + baseline + RESET).repeat(width);
@@ -2373,9 +2375,21 @@ function renderBrailleSparkline(values, width, maxVal, colorMode) {
     out += (dimBase + baseline + RESET).repeat(fill);
   }
 
-  for (const v of visible) {
+  // Map nowIdx (index in original values) to position in rendered output.
+  // visible = values.slice(start), so a now-index in original = nowIdx - start in visible.
+  // The visible portion starts at column (width - visible.length) in the output.
+  const leadingFill = Math.max(0, width - visible.length);
+  const nowInVisible = (typeof nowIdx === "number") ? nowIdx - start : -1;
+  const nowOutCol = (nowInVisible >= 0 && nowInVisible < visible.length)
+    ? leadingFill + nowInVisible
+    : -1;
+
+  for (let i = 0; i < visible.length; i++) {
+    const v = visible[i];
+    const isNow = (leadingFill + i) === nowOutCol;
     if (v <= 0) {
-      out += dimBase + baseline + RESET;
+      // Even with no value, show a dim baseline; highlight current position with a brighter baseline dot.
+      out += (isNow ? nowColor : dimBase) + baseline + RESET;
       continue;
     }
     const ratio = Math.max(0, Math.min(1, v / hi));
@@ -2383,7 +2397,7 @@ function renderBrailleSparkline(values, width, maxVal, colorMode) {
     const filled = Math.max(1, Math.round(ratio * 4));
     let code = 0x2800;
     for (let d = 0; d < filled; d++) code |= bits[d];
-    out += colorFn(ratio) + String.fromCharCode(code) + RESET;
+    out += (isNow ? nowColor : colorFn(ratio)) + String.fromCharCode(code) + RESET;
   }
   return out;
 }
@@ -3539,6 +3553,16 @@ function computeStats(sessions) {
   const hourKey   = localHourKey(new Date(nowMs));
   let spendToday = 0, spendWeek = 0, spendMonth = 0, spendHour = 0;
 
+  // Hourly buckets for today (24 entries: hour 0..23). Drives the daily-spend sparkline.
+  const dailyHourly = new Array(24).fill(0);
+  // Daily buckets for this calendar month. Sized to days-in-current-month.
+  const nowDate = new Date(nowMs);
+  const monthYear = nowDate.getFullYear();
+  const monthMonth = nowDate.getMonth();
+  const daysInMonth = new Date(monthYear, monthMonth + 1, 0).getDate();
+  const monthlyDaily = new Array(daysInMonth).fill(0);
+  const monthStartKey = localDateKey(new Date(monthYear, monthMonth, 1));
+
   let totalCpu = 0, totalMemory = 0, totalTools = 0;
 
   for (const s of sessions) {
@@ -3581,11 +3605,28 @@ function computeStats(sessions) {
         if (day >= monthKey) spendMonth += amt;
         if (day >= weekKey)  spendWeek  += amt;
         if (day >= todayKey) spendToday += amt;
+        // Calendar-month bucket: day key is "YYYY-MM-DD"; index into monthlyDaily
+        if (day >= monthStartKey) {
+          const dayNum = parseInt(day.slice(8, 10), 10);
+          if (!isNaN(dayNum) && dayNum >= 1 && dayNum <= daysInMonth) {
+            monthlyDaily[dayNum - 1] += amt;
+          }
+        }
       }
     }
     if (s.costs_by_hour) {
       const amt = s.costs_by_hour[hourKey];
       if (amt) spendHour += typeof amt === "object" ? Object.values(amt).reduce((a, b) => a + b, 0) : amt;
+      // Today's per-hour buckets: key format is "YYYY-MM-DDTHH"
+      for (const [hk, models] of Object.entries(s.costs_by_hour)) {
+        if (hk.startsWith(todayKey)) {
+          const hourIdx = parseInt(hk.slice(11, 13), 10);
+          if (!isNaN(hourIdx) && hourIdx >= 0 && hourIdx < 24) {
+            const v = typeof models === "object" ? Object.values(models).reduce((a, b) => a + b, 0) : models;
+            dailyHourly[hourIdx] += v;
+          }
+        }
+      }
     }
 
     if (s.model) {
@@ -3614,6 +3655,8 @@ function computeStats(sessions) {
     spendTotal: spendClaude + spendCodex,
     spendClaude, spendCodex,
     spendHour, spendToday, spendWeek, spendMonth,
+    dailyHourly,   // 24 entries: today's spend per hour (0..23)
+    monthlyDaily,  // N entries: this month's spend per day (1..daysInMonth)
     models,
     uptime,
   };
@@ -3783,33 +3826,83 @@ function renderHeader(stats, width, state) {
   const lines = [];
   lines.push(boxTop(width, "Overview"));
 
-  const curSpend = stats.spendTotal || 0;
-  const curTokens = (stats.totalInput || 0) + (stats.totalOutput || 0);
+  // Real-time spend = the latest delta in the sparkline history (last 2s of spend).
+  const lastDelta = _globalSpendDeltaHist.length > 0
+    ? _globalSpendDeltaHist[_globalSpendDeltaHist.length - 1]
+    : 0;
+  const spendToday = stats.spendToday || 0;
+  const spendMonth = stats.spendMonth || 0;
   const memMB = (stats.totalMemory || 0) / (1024 * 1024);
 
   const inner = width - 4; // inside box borders
-  // Two columns: each has label + chart, separated by a gap
   const gap = 2;
   const colW = Math.floor((inner - gap) / 2);
-  const labelW = 22;
+
+  const fmtUsd = (v) => v < 0.01 && v > 0 ? `$${v.toFixed(4)}` : `$${v.toFixed(2)}`;
+
+  // Pad each label text to a fixed width so values (and trendlines) align.
+  const leftLabels  = ["Real-time Spend", "Daily Spend", "Monthly Spend"];
+  const rightLabels = ["Agents CPU", "Agents Mem"];
+  const leftLabelW  = Math.max(...leftLabels.map(s => s.length));
+  const rightLabelW = Math.max(...rightLabels.map(s => s.length));
+
+  const rtSpendVal     = fmtUsd(lastDelta);
+  const dailySpendVal  = fmtUsd(spendToday);
+  const monthSpendVal  = fmtUsd(spendMonth);
+  const cpuVal         = `${stats.totalCpu}%`;
+  const memVal         = `${memMB.toFixed(0)} MB`;
+
+  // Also right-align the spend values to a common width so $ signs line up.
+  const spendValW = Math.max(rtSpendVal.length, dailySpendVal.length, monthSpendVal.length);
+  const rightValW = Math.max(cpuVal.length, memVal.length);
+
+  // Total width of the "label + value" prefix (before the chart) for left col
+  const leftPrefixW = leftLabelW + 1 + spendValW; // label + space + value
+  // Same for right col
+  const rightPrefixW = rightLabelW + 1 + rightValW;
+
+  // Pick a labelW that fits the widest prefix across BOTH columns so the
+  // sparklines start at the same column position in every row.
+  const labelW = Math.max(leftPrefixW, rightPrefixW) + 1; // +1 space before chart
   const chartW = Math.max(4, colW - labelW - 1);
 
-  // Row 1: Spend + CPU
-  const spendLabel = `${C.hdrLabel}Total Spend${RESET} ${C.hdrYellow}$${curSpend.toFixed(2)}${RESET}`;
-  const spendChart = renderBrailleSparkline(_globalSpendDeltaHist, chartW, 0, "spend");
-  const cpuLabel = `${C.hdrLabel}Agents CPU${RESET} ${C.hdrValue}${stats.totalCpu}%${RESET}`;
-  const cpuChart = renderBrailleSparkline(_globalCpuHist, chartW, 100, "cpu");
-  const row1Left = buildOverviewCell(spendLabel, spendChart, labelW, chartW, colW);
+  // Helper: render a "label  value" prefix with label padded and value
+  // left-aligned (so $ signs line up vertically) but trailing-padded so the
+  // trendline starts at the same column across rows.
+  function fmtPrefix(label, value, labelPadW, valPadW, color) {
+    const labelPad = " ".repeat(Math.max(0, labelPadW - label.length));
+    const valPadTrail = " ".repeat(Math.max(0, valPadW - value.length));
+    return `${C.hdrLabel}${label}${RESET}${labelPad} ${color}${value}${RESET}${valPadTrail}`;
+  }
+
+  // "Now" indices for highlighting the current position in each trendline.
+  const nowHour = new Date().getHours();
+  const nowDayIdx = new Date().getDate() - 1;
+  const rtNowIdx = _globalSpendDeltaHist.length - 1;
+
+  // Row 1: Real-time spend + CPU
+  const rtSpendLabel = fmtPrefix("Real-time Spend", rtSpendVal, leftLabelW, spendValW, C.hdrYellow);
+  const rtSpendChart = renderBrailleSparkline(_globalSpendDeltaHist, chartW, 0, "spend", rtNowIdx);
+  const cpuLabel = fmtPrefix("Agents CPU", cpuVal, rightLabelW, rightValW, C.hdrValue);
+  const cpuChart = renderBrailleSparkline(_globalCpuHist, chartW, 100, "cpu", _globalCpuHist.length - 1);
+  const row1Left = buildOverviewCell(rtSpendLabel, rtSpendChart, labelW, chartW, colW);
   const row1Right = buildOverviewCell(cpuLabel, cpuChart, labelW, chartW, colW);
   lines.push(boxLine(row1Left + " ".repeat(gap) + row1Right, width));
 
-  // Row 2: Tokens + Memory
-  const tokLabel = `${C.hdrLabel}Total Tokens${RESET} ${C.hdrValue}${compactTokens(curTokens)}${RESET}`;
-  const tokChart = renderBrailleSparkline(_globalTokenDeltaHist, chartW, 0, "spend");
-  const memLabel = `${C.hdrLabel}Agents Mem${RESET} ${C.hdrValue}${memMB.toFixed(0)} MB${RESET}`;
-  const row2Left = buildOverviewCell(tokLabel, tokChart, labelW, chartW, colW);
+  // Row 2: Daily spend + Memory
+  const dailyLabel = fmtPrefix("Daily Spend", dailySpendVal, leftLabelW, spendValW, C.hdrYellow);
+  const dailyChart = renderBrailleSparkline(stats.dailyHourly || [], chartW, 0, "spend", nowHour);
+  const memLabel = fmtPrefix("Agents Mem", memVal, rightLabelW, rightValW, C.hdrValue);
+  const row2Left = buildOverviewCell(dailyLabel, dailyChart, labelW, chartW, colW);
   const row2Right = buildOverviewCell(memLabel, "", labelW, 0, colW);
   lines.push(boxLine(row2Left + " ".repeat(gap) + row2Right, width));
+
+  // Row 3: Monthly spend
+  const monthlyLabel = fmtPrefix("Monthly Spend", monthSpendVal, leftLabelW, spendValW, C.hdrYellow);
+  const monthlyChart = renderBrailleSparkline(stats.monthlyDaily || [], chartW, 0, "spend", nowDayIdx);
+  const row3Left = buildOverviewCell(monthlyLabel, monthlyChart, labelW, chartW, colW);
+  const row3Right = " ".repeat(colW);
+  lines.push(boxLine(row3Left + " ".repeat(gap) + row3Right, width));
 
   lines.push(boxBottom(width));
   return lines;
