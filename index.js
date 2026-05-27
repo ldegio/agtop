@@ -5303,10 +5303,15 @@ function renderAgentPanel(session, data, panelW, rows, state) {
   let contentW = panelW - 4 - AGENT_TAB_WIDTH - 1; // inner width minus tab sidebar minus separator
   const HOME = process.env.HOME || "";
 
-  // Compute per-tool live counts (entries since agtop started)
+  // Compute per-tool live counts (entries since agtop started). The "live since
+  // agtop started" filter doesn't make sense for a subagent drill-down: subagents
+  // are point-in-time records, and applying the filter would silently zero out
+  // every count for any subagent whose timestamps predate agtop's launch (while
+  // the same subagent's row in the list keeps showing its raw tool count).
+  const liveFilterActive = state.agentLiveFilter && !session._isSubagent;
   const startTime = state._startTime || "";
   const liveCountByTool = {};
-  if (state.agentLiveFilter && m.tool_details) {
+  if (liveFilterActive && m.tool_details) {
     let allLive = 0;
     for (const [tName] of toolList) {
       if (tName === "*All") continue;
@@ -5344,7 +5349,7 @@ function renderAgentPanel(session, data, panelW, rows, state) {
   });
 
   // Apply live filter if active
-  const sorted = state.agentLiveFilter
+  const sorted = liveFilterActive
     ? allSorted.filter(e => {
         const ts = typeof e === "string" ? "" : (e.ts || "");
         return ts >= startTime;
@@ -5420,7 +5425,7 @@ function renderAgentPanel(session, data, panelW, rows, state) {
       state._agentDownArrowRow = r;
     } else if (tabIdx < toolList.length) {
       const [tName, tCount] = toolList[tabIdx];
-      const displayCount = state.agentLiveFilter ? (liveCountByTool[tName] || 0) : tCount;
+      const displayCount = liveFilterActive ? (liveCountByTool[tName] || 0) : tCount;
       const isActive = tabIdx === state.agentToolTab;
       const isHover = tabIdx === state.hoverAgentToolTab;
       const flashTs = state._agentToolFlash[tName] || 0;
@@ -5466,6 +5471,14 @@ function renderAgentPanel(session, data, panelW, rows, state) {
 
     // --- Header row (first content row) ---
     if (r === 0) {
+      // Hide the Live toggle for subagent drill-downs — the filter doesn't apply
+      // there (see liveFilterActive computation above), so showing the button
+      // would suggest a toggle that has no effect.
+      if (session._isSubagent) {
+        state._agentLiveBtn = null;
+        lines.push(line);
+        continue;
+      }
       const liveOn = state.agentLiveFilter;
       const btnInner = liveOn ? "● Live" : "○ Live";
       const btnInnerLen = btnInner.length;
