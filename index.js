@@ -3847,6 +3847,42 @@ function getSelectedSession(state) {
   return row ? row.session : null;
 }
 
+/** Build a session-like object representing a subagent so the existing panel
+ *  renderers can consume it without modification. data_file points at the
+ *  subagent's own jsonl; ghost subagents (no on-disk transcript) get a null
+ *  data_file which yields the empty stub in safeExtractSessionData. */
+function subagentToSession(parent, sa) {
+  const subFile = (parent.data_file && !sa.ghost)
+    ? parent.data_file.replace(/\.jsonl$/, "") + "/subagents/" + sa.agent_id + ".jsonl"
+    : null;
+  return {
+    provider: parent.provider,
+    session_id: sa.agent_id,
+    data_file: subFile,
+    title: sa.description || null,
+    label_source: parent.label_source,
+    _abbrevLabel: parent._abbrevLabel,
+    started_at: sa.started_at,
+    last_active: sa.last_active || sa.started_at,
+    model: sa.model,
+    process: null,                  // subagents share the parent's PID
+    list_total_cost: sa.cost,
+    _isSubagent: true,
+    _parentSession: parent,
+    _subagent: sa,
+  };
+}
+
+/** Return the session whose data the bottom panels should display.
+ *  For subagent rows this is a synthesized subagent-as-session; otherwise the
+ *  same as getSelectedSession. */
+function getSelectedPanelSession(state) {
+  const row = state.flatList[state.selectedRow];
+  if (!row) return null;
+  if (row.type === "subagent") return subagentToSession(row.session, row.subagent);
+  return row.session;
+}
+
 /** Find the flat-list index of the session row that owns the given flat-list row index. */
 function findParentSessionIndex(state, flatIdx) {
   for (let i = flatIdx; i >= 0; i--) {
@@ -5064,6 +5100,13 @@ function renderSystemPanel(session, data, panelW, rows) {
     return lines;
   }
 
+  if (session._isSubagent) {
+    lines.push(C.dimText + "Shared with parent process — no per-subagent OS metrics." + RESET);
+    lines.push(C.dimText + "Select the parent session row to see CPU/memory for the whole session." + RESET);
+    while (lines.length < rows) lines.push("");
+    return lines;
+  }
+
   const pm = session.process;
 
   if (!pm) {
@@ -5866,6 +5909,13 @@ function renderProcessesPanel(session, panelW, rows, state) {
   const lines = [];
   const inner = panelW - 4;
 
+  if (session && session._isSubagent) {
+    lines.push(C.dimText + "Shared with parent process — no per-subagent OS process list." + RESET);
+    lines.push(C.dimText + "Select the parent session row to see its process tree." + RESET);
+    while (lines.length < rows) lines.push("");
+    return lines;
+  }
+
   if (!session || !session.process) {
     lines.push(C.dimText + "Performance data is only available for running sessions" + RESET);
     while (lines.length < rows) lines.push("");
@@ -6253,8 +6303,9 @@ function render(state) {
   }
   screenLines.push(boxBottom(boxW));
 
-  // Bottom detail panels (tabbed) — the session that "owns" the selected virtual row
-  const selected = getSelectedSession(state);
+  // Bottom detail panels (tabbed) — for subagent rows we synthesize a session-like
+  // object so the existing panel renderers can consume the subagent's own data.
+  const selected = getSelectedPanelSession(state);
   const panelPlan = selected ? (selected.provider === "codex" ? state.codexPlan : state.claudePlan) : null;
   state._tabBarRow = screenLines.length + 1; // 1-based row of the tab bar
   state._configPanelTop = screenLines.length + 3; // 1-based: tab bar + rule line → first content row
@@ -7817,8 +7868,8 @@ async function main() {
     return 1;
   }
 
-  // Load panel data for the initially selected session
-  const initSel = getSelectedSession(state);
+  // Load panel data for the initially selected row (subagent-aware)
+  const initSel = getSelectedPanelSession(state);
   if (initSel) {
     state._panelSessionId = initSel.session_id;
     state.panelData = await safeExtractSessionData(initSel);
@@ -7831,9 +7882,9 @@ async function main() {
   const delayMs = args.delay * 1000;
   const doRefresh = async () => {
     await loadSessions(state);
-    // Re-load panel data for current selection
+    // Re-load panel data for current selection (subagent-aware)
     state._panelSessionId = null;
-    const panelSel = getSelectedSession(state);
+    const panelSel = getSelectedPanelSession(state);
     if (panelSel) {
       state._panelSessionId = panelSel.session_id;
       state.panelData = await safeExtractSessionData(panelSel);
@@ -7885,8 +7936,8 @@ async function main() {
       state.dirty = true;
     }
 
-    // Load panel data when selection changes
-    const panelSel = getSelectedSession(state);
+    // Load panel data when selection changes (subagent-aware)
+    const panelSel = getSelectedPanelSession(state);
     if (panelSel && panelSel.session_id !== state._panelSessionId) {
       state._panelSessionId = panelSel.session_id;
       state.panelData = null; // show "Loading..." immediately
