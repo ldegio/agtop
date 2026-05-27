@@ -1698,6 +1698,29 @@ async function extractClaudeSessionData(transcriptPath) {
       cost: money(stats.cost || 0),
       tool_count: stats.tool_count || 0,
       tool_use_id: toolUseId,
+      ghost: false,
+    });
+  }
+
+  // Ghost subagents: parent Agent tool_use blocks whose on-disk transcript is gone
+  // (Claude Code purges old subagent jsonl files but keeps the tool_use/tool_result
+  // pair in the parent transcript). Synthesize a row with the metadata we still have.
+  const seenToolUseIds = new Set(subagents.map(s => s.tool_use_id).filter(Boolean));
+  for (const [tuId, use] of agentToolUses) {
+    if (seenToolUseIds.has(tuId)) continue;
+    subagents.push({
+      agent_id: tuId,
+      type: use.subagent_type || "?",
+      description: use.description || "",
+      model: use.model || "?",
+      started_at: use.ts || null,
+      last_active: null,
+      duration_ms: 0,
+      status: agentResults.has(tuId) ? "done" : "running",
+      cost: 0,
+      tool_count: 0,
+      tool_use_id: tuId,
+      ghost: true,
     });
   }
 
@@ -1725,6 +1748,7 @@ async function extractClaudeSessionData(transcriptPath) {
     _localDates: true,
     _noSubagentModel: true, // cache bust: lastModel now excludes subagent sidechain files
     _hasSubagentsField: true, // cache bust: data.subagents added
+    _hasGhostSubagents: true, // cache bust: subagents now include ghost entries from purged transcripts
   };
 }
 
@@ -1949,7 +1973,8 @@ async function safeExtractSessionData(session) {
   const hasLocalDates = cache[dKey] && cache[dKey]._localDates === true;
   const hasNoSubagentModel = cache[dKey] && cache[dKey]._noSubagentModel === true;
   const hasSubagentsField = cache[dKey] && cache[dKey]._hasSubagentsField === true;
-  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay && hasLocalDates && hasNoSubagentModel && hasSubagentsField) {
+  const hasGhostSubagents = cache[dKey] && cache[dKey]._hasGhostSubagents === true;
+  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay && hasLocalDates && hasNoSubagentModel && hasSubagentsField && hasGhostSubagents) {
     SESSION_DATA_CACHE.set(memKey, cache[dKey]);
     SESSION_DATA_MTIME.set(memKey, effectiveMtime);
     return cache[dKey];
@@ -5368,13 +5393,21 @@ function renderSubagentsPanel(session, data, panelW, rows, state) {
   });
 
   // Column widths (status icon is 1 col wide; we add a trailing space after each column)
+  const startW = 5;  // "HH:MM" — when the parent's Agent tool_use was dispatched
   const typeW = 12;
   const modelW = 12;
   const costW = 7;   // up to "$999.99"
   const toolsW = 5;  // up to 99999
   const timeW = 7;   // "MM:SS", "Xm SSs", "Xh YYm"
-  const fixedW = 1 + 1 + typeW + 1 + modelW + 1 + 1 + costW + 1 + toolsW + 1 + timeW;
+  const fixedW = startW + 1 + 1 + 1 + typeW + 1 + modelW + 1 + 1 + costW + 1 + toolsW + 1 + timeW;
   const descW = Math.max(10, w - fixedW);
+
+  const fmtStart = (ts) => {
+    if (!ts) return "—".padStart(startW);
+    const d = new Date(ts);
+    if (isNaN(d.getTime())) return "?".padStart(startW);
+    return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+  };
 
   const shortModel = (m) => (m || "?")
     .replace(/^claude-/, "")
@@ -5402,6 +5435,7 @@ function renderSubagentsPanel(session, data, panelW, rows, state) {
   // Header row
   const hdr = "\x1b[38;5;245m";
   lines.push(
+    hdr + "START".padEnd(startW) + RESET + " " +
     " " + " " +
     hdr + truncate("TYPE", typeW).padEnd(typeW) + RESET + " " +
     hdr + truncate("MODEL", modelW).padEnd(modelW) + RESET + " " +
@@ -5422,19 +5456,33 @@ function renderSubagentsPanel(session, data, panelW, rows, state) {
     const sa = list[i + state.subagentScroll];
     if (!sa) { lines.push(""); continue; }
     const isRunning = sa.status === "running";
-    const statusIcon = isRunning
-      ? C.chartBarHi + "●" + RESET
-      : C.dimText + "○" + RESET;
+    const isGhost = sa.ghost === true;
+
+    // Status icon: bright ● running / plain ○ done; ghost rows use a dotted ◌ to flag
+    // that the on-disk transcript is gone and per-agent metrics aren't available.
+    let statusIcon;
+    if (isGhost) {
+      statusIcon = C.dimText + "◌" + RESET;
+    } else if (isRunning) {
+      statusIcon = C.chartBarHi + "●" + RESET;
+    } else {
+      statusIcon = C.dimText + "○" + RESET;
+    }
+
     const typeStr = truncate(sa.type || "?", typeW).padEnd(typeW);
     const modelStr = truncate(shortModel(sa.model), modelW).padEnd(modelW);
     const descStr = truncate(sa.description || "(no description)", descW).padEnd(descW);
     const costNum = typeof sa.cost === "number" ? sa.cost : Number(sa.cost) || 0;
-    const costStr = ("$" + costNum.toFixed(2)).padStart(costW);
-    const toolsStr = String(sa.tool_count || 0).padStart(toolsW);
-    const timeStr = fmtDur(sa.duration_ms).padStart(timeW);
+    // Ghost rows: we don't know cost/tools/duration — show em-dash placeholders.
+    const costStr  = (isGhost ? "—"  : ("$" + costNum.toFixed(2))).padStart(costW);
+    const toolsStr = (isGhost ? "—"  : String(sa.tool_count || 0)).padStart(toolsW);
+    const timeStr  = (isGhost ? "—"  : fmtDur(sa.duration_ms)).padStart(timeW);
 
-    const rowColor = isRunning ? C.hdrValue : "\x1b[38;5;250m";
+    // Ghost rows are dimmed overall; live rows use brighter row color when running.
+    const rowColor = isGhost ? C.dimText : (isRunning ? C.hdrValue : "\x1b[38;5;250m");
+    const startStr = fmtStart(sa.started_at);
     lines.push(
+      C.dimText + startStr + RESET + " " +
       statusIcon + " " +
       rowColor + typeStr + RESET + " " +
       rowColor + modelStr + RESET + " " +
