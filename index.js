@@ -4307,12 +4307,34 @@ function renderSubagentMarkerRow(session, expanded, count, isSelected, width, hS
   const fg = isSelected ? C.selFg : "";
   const base = bg + fg;
   const chev = expanded ? "▼" : "▶";
+  const subs = session.list_subagents || [];
   const cost = typeof session.list_subagents_cost === "number"
     ? "$" + session.list_subagents_cost.toFixed(2)
     : null;
-  const ghosts = (session.list_subagents || []).filter(s => s.ghost).length;
+  const ghosts = subs.filter(s => s.ghost).length;
   const ghostNote = ghosts > 0 ? `  ${ghosts} purged` : "";
-  const label = `  └${chev} ${count} subagent${count === 1 ? "" : "s"}${cost ? `  (${cost})` : ""}${ghostNote}`;
+  // Average duration is only worth showing once there are enough samples to
+  // be representative. Ghosts contribute no duration so they're excluded.
+  let avgNote = "";
+  if (count > 3) {
+    const durations = subs.filter(s => !s.ghost && typeof s.duration_ms === "number" && s.duration_ms > 0)
+      .map(s => s.duration_ms);
+    if (durations.length > 0) {
+      const avgMs = durations.reduce((a, b) => a + b, 0) / durations.length;
+      const s = Math.round(avgMs / 1000);
+      let avgStr;
+      if (s < 60)      avgStr = `${s}s`;
+      else if (s < 3600) {
+        const m = Math.floor(s / 60); const r = s % 60;
+        avgStr = `${m}m${String(r).padStart(2, "0")}s`;
+      } else {
+        const h = Math.floor(s / 3600); const mr = Math.floor((s % 3600) / 60);
+        avgStr = `${h}h${String(mr).padStart(2, "0")}m`;
+      }
+      avgNote = `  avg ${avgStr}`;
+    }
+  }
+  const label = `  └${chev} ${count} subagent${count === 1 ? "" : "s"}${cost ? `  (${cost})` : ""}${avgNote}${ghostNote}`;
   const text = label.length > width - 2 ? label.slice(0, width - 3) + "…" : label;
   const color = isSelected ? "" : C.dimText;
   const line = base + color + text + RESET + base;
