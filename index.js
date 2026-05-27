@@ -1812,13 +1812,26 @@ function saveUiPrefs(prefs) {
 function diskCacheKey(filePath) {
   try {
     const st = statSync(filePath);
-    // For Claude transcripts, also fold in the subagents/ dir mtime so adding a new
-    // subagent file invalidates the cached extraction (the main jsonl mtime can stay
-    // unchanged when a subagent is dispatched).
+    // For Claude transcripts, also fold in the max mtime across all subagent jsonl
+    // files. The parent jsonl's mtime alone doesn't reflect activity in a running
+    // subagent (whose file is appended in-process by Claude Code without touching
+    // the parent), nor does the subagents/ dir mtime (which only changes when files
+    // are added or removed, not when existing ones are modified).
     let subTag = "";
     if (filePath.endsWith(".jsonl")) {
       const subDir = filePath.replace(/\.jsonl$/, "") + "/subagents";
-      try { subTag = `|${statSync(subDir).mtimeMs}`; } catch { /* no subagents dir */ }
+      try {
+        const entries = listDir(subDir);
+        let maxSubMtime = statSync(subDir).mtimeMs;
+        for (const entry of entries) {
+          if (!entry.endsWith(".jsonl")) continue;
+          try {
+            const m = statSync(subDir + "/" + entry).mtimeMs;
+            if (m > maxSubMtime) maxSubMtime = m;
+          } catch { /* file vanished between readdir and stat */ }
+        }
+        subTag = `|${maxSubMtime}`;
+      } catch { /* no subagents dir */ }
     }
     return `${filePath}|${st.size}|${st.mtimeMs}${subTag}`;
   } catch {
