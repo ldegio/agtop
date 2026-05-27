@@ -1695,7 +1695,7 @@ async function extractClaudeSessionData(transcriptPath) {
       last_active: stats.last_ts || null,
       duration_ms: durationMs,
       status,
-      cost: money(stats.cost || 0),
+      cost: stats.cost || 0,
       tool_count: stats.tool_count || 0,
       tool_use_id: toolUseId,
       ghost: false,
@@ -1749,6 +1749,7 @@ async function extractClaudeSessionData(transcriptPath) {
     _noSubagentModel: true, // cache bust: lastModel now excludes subagent sidechain files
     _hasSubagentsField: true, // cache bust: data.subagents added
     _hasGhostSubagents: true, // cache bust: subagents now include ghost entries from purged transcripts
+    _subagentCostNumber: true, // cache bust: subagent.cost is now a number (was a money() string)
   };
 }
 
@@ -1974,7 +1975,8 @@ async function safeExtractSessionData(session) {
   const hasNoSubagentModel = cache[dKey] && cache[dKey]._noSubagentModel === true;
   const hasSubagentsField = cache[dKey] && cache[dKey]._hasSubagentsField === true;
   const hasGhostSubagents = cache[dKey] && cache[dKey]._hasGhostSubagents === true;
-  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay && hasLocalDates && hasNoSubagentModel && hasSubagentsField && hasGhostSubagents) {
+  const subagentCostNumber = cache[dKey] && cache[dKey]._subagentCostNumber === true;
+  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay && hasLocalDates && hasNoSubagentModel && hasSubagentsField && hasGhostSubagents && subagentCostNumber) {
     SESSION_DATA_CACHE.set(memKey, cache[dKey]);
     SESSION_DATA_MTIME.set(memKey, effectiveMtime);
     return cache[dKey];
