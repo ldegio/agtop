@@ -1702,10 +1702,38 @@ async function extractClaudeSessionData(transcriptPath) {
     });
   }
 
+  // Fallback pairing: on-disk subagents whose meta.json lacked toolUseId (older
+  // Explore agents) still match a real Agent tool_use in the parent. Pair them by
+  // description (closest started_at wins on ties) so we don't synthesize a ghost
+  // for the same subagent. Each parent tool_use can be claimed at most once.
+  const seenToolUseIds = new Set(subagents.map(s => s.tool_use_id).filter(Boolean));
+  const unclaimedOnDisk = subagents.filter(s => !s.tool_use_id);
+  if (unclaimedOnDisk.length > 0 && agentToolUses.size > 0) {
+    for (const sa of unclaimedOnDisk) {
+      let best = null;
+      let bestDelta = Infinity;
+      const saTs = sa.started_at ? new Date(sa.started_at).getTime() : null;
+      for (const [tuId, use] of agentToolUses) {
+        if (seenToolUseIds.has(tuId)) continue;
+        if ((use.description || "") !== (sa.description || "")) continue;
+        const useTs = use.ts ? new Date(use.ts).getTime() : null;
+        const delta = (saTs !== null && useTs !== null) ? Math.abs(saTs - useTs) : 0;
+        if (delta < bestDelta) { best = tuId; bestDelta = delta; }
+      }
+      if (best) {
+        sa.tool_use_id = best;
+        const use = agentToolUses.get(best);
+        // Now that we know the parent tool_use, prefer its data where ours was guessed
+        sa.status = agentResults.has(best) ? "done" : sa.status;
+        if (!sa.type || sa.type === "?") sa.type = use.subagent_type || sa.type;
+        seenToolUseIds.add(best);
+      }
+    }
+  }
+
   // Ghost subagents: parent Agent tool_use blocks whose on-disk transcript is gone
   // (Claude Code purges old subagent jsonl files but keeps the tool_use/tool_result
   // pair in the parent transcript). Synthesize a row with the metadata we still have.
-  const seenToolUseIds = new Set(subagents.map(s => s.tool_use_id).filter(Boolean));
   for (const [tuId, use] of agentToolUses) {
     if (seenToolUseIds.has(tuId)) continue;
     subagents.push({
@@ -1750,6 +1778,7 @@ async function extractClaudeSessionData(transcriptPath) {
     _hasSubagentsField: true, // cache bust: data.subagents added
     _hasGhostSubagents: true, // cache bust: subagents now include ghost entries from purged transcripts
     _subagentCostNumber: true, // cache bust: subagent.cost is now a number (was a money() string)
+    _subagentDescPairing: true, // cache bust: on-disk subagents without toolUseId now back-paired by description
   };
 }
 
@@ -1989,7 +2018,8 @@ async function safeExtractSessionData(session) {
   const hasSubagentsField = cache[dKey] && cache[dKey]._hasSubagentsField === true;
   const hasGhostSubagents = cache[dKey] && cache[dKey]._hasGhostSubagents === true;
   const subagentCostNumber = cache[dKey] && cache[dKey]._subagentCostNumber === true;
-  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay && hasLocalDates && hasNoSubagentModel && hasSubagentsField && hasGhostSubagents && subagentCostNumber) {
+  const subagentDescPairing = cache[dKey] && cache[dKey]._subagentDescPairing === true;
+  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay && hasLocalDates && hasNoSubagentModel && hasSubagentsField && hasGhostSubagents && subagentCostNumber && subagentDescPairing) {
     SESSION_DATA_CACHE.set(memKey, cache[dKey]);
     SESSION_DATA_MTIME.set(memKey, effectiveMtime);
     return cache[dKey];
