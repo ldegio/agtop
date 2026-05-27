@@ -3830,6 +3830,7 @@ function buildFlatList(state) {
       const isExpanded = expanded.has(sessionKey(s));
       flat.push({ type: "marker", session: s, expanded: isExpanded, count: subs.length });
       if (isExpanded) {
+        flat.push({ type: "subagent-header", session: s });
         const sorted = subs.slice().sort((a, b) => {
           if (a.status !== b.status) return a.status === "running" ? -1 : 1;
           return (b.started_at || "").localeCompare(a.started_at || "");
@@ -4276,6 +4277,9 @@ function renderFlatRow(row, index, isSelected, width, now, hScroll, state) {
   if (row.type === "marker") {
     return renderSubagentMarkerRow(row.session, row.expanded, row.count, isSelected, width, hScroll, state);
   }
+  if (row.type === "subagent-header") {
+    return renderSubagentHeaderRow(isSelected, width, hScroll, state);
+  }
   if (row.type === "subagent") {
     return renderSubagentChildRow(row.subagent, isSelected, width, hScroll, state);
   }
@@ -4314,18 +4318,31 @@ function renderSubagentChildRow(sa, isSelected, width, hScroll, state) {
     ? String(ts.getHours()).padStart(2, "0") + ":" + String(ts.getMinutes()).padStart(2, "0")
     : "  —  ".slice(0, 5);
   const cost = (isGhost || typeof sa.cost !== "number")
-    ? "  —  "
+    ? "      —"   // 7-char column, right-aligned em-dash to match $N.NN values
     : ("$" + sa.cost.toFixed(2)).padStart(7);
-  const tools = (isGhost ? "  —" : String(sa.tool_count || 0).padStart(3));
+  const tools = (isGhost ? "    —" : String(sa.tool_count || 0).padStart(5));
   const desc = sa.description || "(no description)";
   const model = (sa.model || "?").replace(/^claude-/, "").replace(/-\d{8}$/, "");
-  // Layout: "     ◌ 10:18  $0.42  142  haiku-4-5  Implement Task 1"
+  // Layout: "     ◌ 10:18  $0.42      142  haiku-4-5     Implement Task 1"
   const prefix = `     ${icon} ${startStr}  ${cost}  ${tools}  ${(model.length > 12 ? model.slice(0, 11) + "…" : model).padEnd(12)}  `;
   const maxDesc = Math.max(8, width - 2 - prefix.replace(/\x1b\[[^m]*m/g, "").length);
   const descShort = desc.length > maxDesc ? desc.slice(0, maxDesc - 1) + "…" : desc;
   const rowColor = isSelected ? "" : (isGhost ? C.dimText : "\x1b[38;5;250m");
   const line = base + " ".repeat(5) + (iconColor || "") + icon + RESET + base +
     rowColor + ` ${startStr}  ${cost}  ${tools}  ${(model.length > 12 ? model.slice(0, 11) + "…" : model).padEnd(12)}  ${descShort}` + RESET + base;
+  return base + ansiSlice(line, hScroll, width) + RESET;
+}
+
+/** Column-label row shown right after the expansion marker so subagent rows
+ *  are self-describing. Aligns with renderSubagentChildRow's column widths. */
+function renderSubagentHeaderRow(isSelected, width, hScroll, state) {
+  const bg = isSelected ? C.selBg : "";
+  const fg = isSelected ? C.selFg : "";
+  const base = bg + fg;
+  const dim = isSelected ? "" : C.dimText;
+  // 5sp indent + 1ch icon + 1sp + 5ch START + 2sp + 7ch COST + 2sp + 5ch TOOLS + 2sp + 12ch MODEL + 2sp + DESCRIPTION
+  const labels = "     " + " " + " " + "START" + "  " + "   COST" + "  " + "TOOLS" + "  " + "MODEL       " + "  " + "DESCRIPTION";
+  const line = base + dim + labels + RESET + base;
   return base + ansiSlice(line, hScroll, width) + RESET;
 }
 
@@ -6910,7 +6927,7 @@ function handleEvent(event, state) {
     }
   }
   if (event.type === "left" && flatRow) {
-    if (flatRow.type === "subagent" || flatRow.type === "marker" || flatRow.type === "session") {
+    if (flatRow.type === "subagent" || flatRow.type === "subagent-header" || flatRow.type === "marker" || flatRow.type === "session") {
       const s = flatRow.session;
       if (state.expandedSubagents.has(sessionKey(s))) {
         state.expandedSubagents.delete(sessionKey(s));
@@ -6923,8 +6940,8 @@ function handleEvent(event, state) {
       }
     }
   }
-  // Enter on a marker toggles the expansion of its parent
-  if (event.type === "enter" && flatRow && flatRow.type === "marker") {
+  // Enter on a marker or sub-header toggles the expansion of its parent
+  if (event.type === "enter" && flatRow && (flatRow.type === "marker" || flatRow.type === "subagent-header")) {
     const s = flatRow.session;
     if (state.expandedSubagents.has(sessionKey(s))) {
       state.expandedSubagents.delete(sessionKey(s));
