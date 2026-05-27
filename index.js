@@ -1399,13 +1399,28 @@ async function extractClaudeSessionData(transcriptPath) {
   const CMD_RE = /<command-name>\/?([^<]+)<\/command-name>/g;
 
   const transcriptFiles = claudeTranscriptFiles(transcriptPath);
+  // Per-subagent-file accumulators (one entry per non-main file)
+  const subagentStats = new Map(); // filePath → { cost, tool_count, first_ts, last_ts, last_model }
+  for (const fp of transcriptFiles.slice(1)) {
+    subagentStats.set(fp, { cost: 0, tool_count: 0, first_ts: null, last_ts: null, last_model: null });
+  }
+  // Agent tool_use blocks in the main file and their matching tool_results (for status detection)
+  const agentToolUses = new Map(); // tool_use_id → { description, subagent_type, model, ts }
+  const agentResults = new Set();  // tool_use_ids that have a tool_result in the main file
   for (const [fileIdx, filePath] of transcriptFiles.entries()) {
     const isMainFile = fileIdx === 0;
+    const fileStats = isMainFile ? null : subagentStats.get(filePath);
     // Map of requestId → latest token snapshot (streaming writes same requestId multiple times;
     // the last entry has final token counts — keep that one, discard earlier partials).
     const lastByKey = new Map();
     // Keyless entries (no requestId/messageId) accumulate immediately.
     await forEachJsonl(filePath, (item) => {
+      // Per-subagent activity tracking (any entry with a timestamp counts as activity)
+      if (fileStats && item.timestamp) {
+        if (!fileStats.first_ts || item.timestamp < fileStats.first_ts) fileStats.first_ts = item.timestamp;
+        if (!fileStats.last_ts  || item.timestamp > fileStats.last_ts)  fileStats.last_ts  = item.timestamp;
+      }
+
       // --- System branch: accumulate API duration ---
       if (item.type === "system" && item.subtype === "turn_duration" && item.durationMs) {
         metrics.api_duration_ms += item.durationMs;
@@ -1442,6 +1457,10 @@ async function extractClaudeSessionData(transcriptPath) {
           for (const block of content) {
             if (typeof block === "string") texts.push(block);
             else if (block && typeof block.text === "string") texts.push(block.text);
+            // Track Agent tool_result ids (main file only) for subagent status detection
+            if (isMainFile && block && block.type === "tool_result" && block.tool_use_id) {
+              agentResults.add(block.tool_use_id);
+            }
           }
         }
         for (const text of texts) {
@@ -1474,6 +1493,19 @@ async function extractClaudeSessionData(transcriptPath) {
           }
           metrics.tools[name] = (metrics.tools[name] || 0) + 1;
           metrics.tool_count++;
+
+          // Track Agent tool_use blocks in main file (for subagent status + description fallback)
+          if (isMainFile && name === "Agent" && block.id) {
+            const inp = block.input || {};
+            agentToolUses.set(block.id, {
+              description: inp.description || "",
+              subagent_type: inp.subagent_type || "",
+              model: inp.model || "",
+              ts: item.timestamp || "",
+            });
+          }
+          // Per-subagent tool count (tools the subagent itself invoked)
+          if (fileStats) fileStats.tool_count++;
 
           // Per-tool invocation detail with timestamp
           const input = block.input || {};
@@ -1544,16 +1576,16 @@ async function extractClaudeSessionData(transcriptPath) {
         // the final entry has the highest (correct) token counts.
         lastByKey.set(key, snapshot);
       } else {
-        accum(model, inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, item.timestamp || "", isMainFile);
+        accum(filePath, model, inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, item.timestamp || "", isMainFile);
       }
     });
     // Flush the last-occurrence map for this file
     for (const { inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, model, ts } of lastByKey.values()) {
-      accum(model, inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, ts, isMainFile);
+      accum(filePath, model, inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, ts, isMainFile);
     }
   }
 
-  function accum(model, inp, cacheR, out, cw5m, cw1h, ts, isMain) {
+  function accum(filePath, model, inp, cacheR, out, cw5m, cw1h, ts, isMain) {
     lastModel = model;
     if (isMain) lastMainModel = model;
     models[model] = (models[model] || 0) + 1;
@@ -1595,6 +1627,19 @@ async function extractClaudeSessionData(transcriptPath) {
       costsByDay[dateKey][model]  = (costsByDay[dateKey][model]  || 0) + callCost;
       costsByHour[hourKey][model] = (costsByHour[hourKey][model] || 0) + callCost;
     }
+    // Per-subagent cost + last-model tracking
+    if (!isMain) {
+      const stats = subagentStats.get(filePath);
+      if (stats) {
+        const callCost2 = tokenCost(inp, pricing.input_per_million) +
+          tokenCost(cacheR, pricing.cache_read_per_million) +
+          tokenCost(out, pricing.output_per_million) +
+          tokenCost(cw5m, pricing.cache_write_5m_per_million) +
+          tokenCost(cw1h, pricing.cache_write_1h_per_million);
+        stats.cost += callCost2;
+        stats.last_model = model;
+      }
+    }
   }
 
   if (!Object.keys(models).length)
@@ -1612,6 +1657,49 @@ async function extractClaudeSessionData(transcriptPath) {
     const modelTotal = Object.values(c).reduce((a, b) => a + b, 0);
     return { model, tokens: t, costs: c, total: money(modelTotal) };
   });
+
+  // Build per-subagent summary (one entry per file in <stem>/subagents/)
+  const subagents = [];
+  const nowMs = Date.now();
+  for (const fp of transcriptFiles.slice(1)) {
+    const stats = subagentStats.get(fp) || {};
+    const agentFile = basename(fp);                          // "agent-XXXX.jsonl"
+    const agentId = agentFile.replace(/\.jsonl$/, "");        // "agent-XXXX"
+    const metaPath = fp.replace(/\.jsonl$/, ".meta.json");
+    let meta = {};
+    try { meta = JSON.parse(readFileSync(metaPath, "utf-8")); } catch { /* missing sidecar */ }
+    const toolUseId = meta.toolUseId || null;
+    const parentUse = toolUseId ? agentToolUses.get(toolUseId) : null;
+    const type = meta.agentType || (parentUse && parentUse.subagent_type) || "?";
+    const description = meta.description || (parentUse && parentUse.description) || "";
+    const model = stats.last_model || (parentUse && parentUse.model) || "?";
+    let fileMtimeMs = 0;
+    try { fileMtimeMs = statSync(fp).mtime.getTime(); } catch {}
+    const lastTsMs = stats.last_ts ? new Date(stats.last_ts).getTime() : 0;
+    const firstTsMs = stats.first_ts ? new Date(stats.first_ts).getTime() : 0;
+    const lastActiveMs = Math.max(fileMtimeMs, lastTsMs);
+    const durationMs = (firstTsMs && lastTsMs) ? Math.max(0, lastTsMs - firstTsMs) : 0;
+    // Status: prefer parent tool_result presence; fall back to recency when no tool_use_id known.
+    let status;
+    if (toolUseId) {
+      status = agentResults.has(toolUseId) ? "done" : "running";
+    } else {
+      status = (nowMs - lastActiveMs < 30000) ? "running" : "done";
+    }
+    subagents.push({
+      agent_id: agentId,
+      type,
+      description,
+      model,
+      started_at: stats.first_ts || null,
+      last_active: stats.last_ts || null,
+      duration_ms: durationMs,
+      status,
+      cost: money(stats.cost || 0),
+      tool_count: stats.tool_count || 0,
+      tool_use_id: toolUseId,
+    });
+  }
 
   return {
     provider: "claude",
@@ -1633,8 +1721,10 @@ async function extractClaudeSessionData(transcriptPath) {
     costsByDay,
     costsByHour,
     metrics,
+    subagents,
     _localDates: true,
     _noSubagentModel: true, // cache bust: lastModel now excludes subagent sidechain files
+    _hasSubagentsField: true, // cache bust: data.subagents added
   };
 }
 
@@ -1697,7 +1787,15 @@ function saveUiPrefs(prefs) {
 function diskCacheKey(filePath) {
   try {
     const st = statSync(filePath);
-    return `${filePath}|${st.size}|${st.mtimeMs}`;
+    // For Claude transcripts, also fold in the subagents/ dir mtime so adding a new
+    // subagent file invalidates the cached extraction (the main jsonl mtime can stay
+    // unchanged when a subagent is dispatched).
+    let subTag = "";
+    if (filePath.endsWith(".jsonl")) {
+      const subDir = filePath.replace(/\.jsonl$/, "") + "/subagents";
+      try { subTag = `|${statSync(subDir).mtimeMs}`; } catch { /* no subagents dir */ }
+    }
+    return `${filePath}|${st.size}|${st.mtimeMs}${subTag}`;
   } catch {
     return null;
   }
@@ -1850,7 +1948,8 @@ async function safeExtractSessionData(session) {
   const hasCostsByDay = cache[dKey] && typeof cache[dKey].costsByHour === "object";
   const hasLocalDates = cache[dKey] && cache[dKey]._localDates === true;
   const hasNoSubagentModel = cache[dKey] && cache[dKey]._noSubagentModel === true;
-  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay && hasLocalDates && hasNoSubagentModel) {
+  const hasSubagentsField = cache[dKey] && cache[dKey]._hasSubagentsField === true;
+  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay && hasLocalDates && hasNoSubagentModel && hasSubagentsField) {
     SESSION_DATA_CACHE.set(memKey, cache[dKey]);
     SESSION_DATA_MTIME.set(memKey, effectiveMtime);
     return cache[dKey];
@@ -3485,6 +3584,7 @@ function createState() {
     _costDragStartRow: 0,
     _costDragStartScroll: 0,
     configScroll: 0, // scroll offset in Config panel content
+    subagentScroll: 0, // scroll offset in Subagents panel
     configSubTabHover: -1, // hover over config sub-tab
     _configPanelTop: 0, // 1-based row of first content row in config panel
     _configCopyTargets: [], // [{row, copyPath}]
@@ -4249,33 +4349,81 @@ const MAX_PANEL = 30;
  * Build content lines for each of the three bottom panels, then merge
  * them side-by-side with box borders into composite screen lines.
  */
-const BOTTOM_TABS = ["Info", "Performance", "Processes", "Tool Activity", "Cost", "Config"];
+const BOTTOM_TABS = ["Info", "Performance", "Processes", "Tool Activity", "Cost", "Config", "Subagents"];
+// Tabs that are hidden unless the session has data for them. Map: tabIdx → predicate(data).
+const CONDITIONAL_TABS = {
+  6: (data) => !!(data && Array.isArray(data.subagents) && data.subagents.length > 0),
+};
+
+/** Return the indices of BOTTOM_TABS visible for this session's data, in display order. */
+function visibleBottomTabs(data) {
+  const out = [];
+  for (let i = 0; i < BOTTOM_TABS.length; i++) {
+    const cond = CONDITIONAL_TABS[i];
+    if (cond && !cond(data)) continue;
+    out.push(i);
+  }
+  return out;
+}
+
+/** Resolve state.bottomTab against visible tabs. Falls back to first visible if hidden. */
+function resolveActiveTab(state, data) {
+  const vis = visibleBottomTabs(data);
+  const wanted = state.bottomTab;
+  if (vis.includes(wanted)) return wanted;
+  return vis[0] || 0;
+}
+
+/** Select the Nth (0-based) tab in the static BOTTOM_TABS list, skipping if hidden for the current session. */
+function selectBottomTabByNumber(state, staticIdx) {
+  const cond = CONDITIONAL_TABS[staticIdx];
+  if (cond && !cond(state.panelData)) return; // tab not visible right now — ignore the keypress
+  state.bottomTab = staticIdx;
+  state.dirty = true;
+  saveUiPrefs({ bottomTab: state.bottomTab, listTab: state.listTab });
+}
+
+/** Cycle to the next visible bottom tab (delta = +1 or -1). */
+function cycleBottomTab(state, delta) {
+  const vis = visibleBottomTabs(state.panelData);
+  if (vis.length === 0) return;
+  const cur = vis.indexOf(resolveActiveTab(state, state.panelData));
+  const next = vis[((cur < 0 ? 0 : cur) + delta + vis.length) % vis.length];
+  state.bottomTab = next;
+  state.dirty = true;
+  saveUiPrefs({ bottomTab: state.bottomTab, listTab: state.listTab });
+}
 
 function renderBottomPanels(session, data, plan, width, panelHeight, activeTab, hoverTab, state) {
   const bc = C.border;
   const innerW = width - 4; // content inside │ ... │
   const innerH = panelHeight - 3; // top border + tab/rule line + bottom border
 
+  // Compute visible tabs for this session. Conditional tabs (e.g. Subagents) may be hidden.
+  const visIdxs = visibleBottomTabs(data);
+
   // Build tab positions first (shared between top border and rule line)
   // Layout: ╭─ Session  System  Tool Activity ──────────╮
   //         │  ───────━━━━━━━━──────────────────────────  │
   const tabParts = []; // [{col, len, idx}]
   let col = 3; // after "╭─ " or "│  "
-  for (let i = 0; i < BOTTOM_TABS.length; i++) {
+  for (let i = 0; i < visIdxs.length; i++) {
     if (i > 0) col += 2; // 2-space gap
-    tabParts.push({ col, len: BOTTOM_TABS[i].length, idx: i });
-    col += BOTTOM_TABS[i].length;
+    const ti = visIdxs[i];
+    tabParts.push({ col, len: BOTTOM_TABS[ti].length, idx: ti });
+    col += BOTTOM_TABS[ti].length;
   }
   const labelsEnd = col; // first char after last label
 
   // --- Top border with tab labels ---
   let topLine = bc + BOX.tl + BOX.h + " " + RESET;
-  for (let i = 0; i < BOTTOM_TABS.length; i++) {
+  for (let i = 0; i < visIdxs.length; i++) {
     if (i > 0) topLine += "  ";
-    const name = BOTTOM_TABS[i];
-    if (i === activeTab) {
+    const ti = visIdxs[i];
+    const name = BOTTOM_TABS[ti];
+    if (ti === activeTab) {
       topLine += C.panelTitle + name + RESET;
-    } else if (i === hoverTab) {
+    } else if (ti === hoverTab) {
       topLine += "\x1b[4;38;5;179m" + name + RESET; // underline amber on hover
     } else {
       topLine += "\x1b[38;5;245m" + name + RESET;
@@ -4288,12 +4436,13 @@ function renderBottomPanels(session, data, plan, width, panelHeight, activeTab, 
   // --- Underline rule: bright under active tab, dim elsewhere ---
   const dimRule = "\x1b[38;5;238m";
   let ruleLine = bc + BOX.v + RESET + dimRule + "──" + RESET;
-  for (let i = 0; i < BOTTOM_TABS.length; i++) {
+  for (let i = 0; i < visIdxs.length; i++) {
     if (i > 0) ruleLine += dimRule + "──" + RESET;
-    const name = BOTTOM_TABS[i];
-    if (i === activeTab) {
+    const ti = visIdxs[i];
+    const name = BOTTOM_TABS[ti];
+    if (ti === activeTab) {
       ruleLine += C.borderHi + "━".repeat(name.length) + RESET;
-    } else if (i === hoverTab) {
+    } else if (ti === hoverTab) {
       ruleLine += "\x1b[38;5;245m" + "━".repeat(name.length) + RESET; // subtle underline on hover
     } else {
       ruleLine += dimRule + "─".repeat(name.length) + RESET;
@@ -4312,6 +4461,7 @@ function renderBottomPanels(session, data, plan, width, panelHeight, activeTab, 
     case 3: contentLines = renderAgentPanel(session, data, width, innerH, state); break;
     case 4: contentLines = renderCostPanel(session, data, plan, width, innerH, state.costScroll, state); break;
     case 5: contentLines = renderConfigPanel(session, width, innerH, state); break;
+    case 6: contentLines = renderSubagentsPanel(session, data, width, innerH, state); break;
     default: contentLines = renderSessionInfoPanel(session, data, plan, width, innerH);
   }
 
@@ -5182,6 +5332,124 @@ function renderAgentPanel(session, data, panelW, rows, state) {
 }
 
 // ---------------------------------------------------------------------------
+// Render: subagents panel
+// ---------------------------------------------------------------------------
+
+/** Render the Subagents panel: one row per subagent the session has spawned.
+ *  Read-only listing. Sorted with running entries first, then newest started_at first. */
+function renderSubagentsPanel(session, data, panelW, rows, state) {
+  const lines = [];
+  const w = panelW - 4;
+
+  if (!session) {
+    lines.push(C.dimText + "No session selected" + RESET);
+    while (lines.length < rows) lines.push("");
+    return lines;
+  }
+  if (!data) {
+    lines.push(C.dimText + "Loading..." + RESET);
+    while (lines.length < rows) lines.push("");
+    return lines;
+  }
+
+  const list = (data.subagents || []).slice();
+  if (list.length === 0) {
+    lines.push(C.dimText + "No subagents" + RESET);
+    while (lines.length < rows) lines.push("");
+    return lines;
+  }
+
+  // Running first; within each status group, newest started_at first.
+  list.sort((a, b) => {
+    if (a.status !== b.status) return a.status === "running" ? -1 : 1;
+    const aTs = a.started_at || "";
+    const bTs = b.started_at || "";
+    return bTs.localeCompare(aTs);
+  });
+
+  // Column widths (status icon is 1 col wide; we add a trailing space after each column)
+  const typeW = 12;
+  const modelW = 12;
+  const costW = 7;   // up to "$999.99"
+  const toolsW = 5;  // up to 99999
+  const timeW = 7;   // "MM:SS", "Xm SSs", "Xh YYm"
+  const fixedW = 1 + 1 + typeW + 1 + modelW + 1 + 1 + costW + 1 + toolsW + 1 + timeW;
+  const descW = Math.max(10, w - fixedW);
+
+  const shortModel = (m) => (m || "?")
+    .replace(/^claude-/, "")
+    .replace(/-\d{8}$/, "")
+    .replace(/^gpt-/, "");
+
+  const fmtDur = (ms) => {
+    if (!ms || ms <= 0) return "—";
+    const s = Math.round(ms / 1000);
+    if (s < 60)    return `${s}s`;
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    if (m < 60)    return `${m}m${String(r).padStart(2, "0")}s`;
+    const h = Math.floor(m / 60);
+    const mr = m % 60;
+    return `${h}h${String(mr).padStart(2, "0")}m`;
+  };
+
+  const truncate = (s, n) => {
+    s = String(s ?? "");
+    if (s.length <= n) return s;
+    return s.slice(0, Math.max(1, n - 1)) + "…";
+  };
+
+  // Header row
+  const hdr = "\x1b[38;5;245m";
+  lines.push(
+    " " + " " +
+    hdr + truncate("TYPE", typeW).padEnd(typeW) + RESET + " " +
+    hdr + truncate("MODEL", modelW).padEnd(modelW) + RESET + " " +
+    hdr + truncate("DESCRIPTION", descW).padEnd(descW) + RESET + " " +
+    hdr + "COST".padStart(costW) + RESET + " " +
+    hdr + "TOOLS".padStart(toolsW) + RESET + " " +
+    hdr + "TIME".padStart(timeW) + RESET
+  );
+
+  // Scroll handling (auto-clamp; default top)
+  if (state.subagentScroll === undefined) state.subagentScroll = 0;
+  if (state.subagentScroll < 0) state.subagentScroll = 0;
+  const visibleRows = Math.max(0, rows - 1);
+  const maxScroll = Math.max(0, list.length - visibleRows);
+  if (state.subagentScroll > maxScroll) state.subagentScroll = maxScroll;
+
+  for (let i = 0; i < visibleRows; i++) {
+    const sa = list[i + state.subagentScroll];
+    if (!sa) { lines.push(""); continue; }
+    const isRunning = sa.status === "running";
+    const statusIcon = isRunning
+      ? C.chartBarHi + "●" + RESET
+      : C.dimText + "○" + RESET;
+    const typeStr = truncate(sa.type || "?", typeW).padEnd(typeW);
+    const modelStr = truncate(shortModel(sa.model), modelW).padEnd(modelW);
+    const descStr = truncate(sa.description || "(no description)", descW).padEnd(descW);
+    const costNum = typeof sa.cost === "number" ? sa.cost : Number(sa.cost) || 0;
+    const costStr = ("$" + costNum.toFixed(2)).padStart(costW);
+    const toolsStr = String(sa.tool_count || 0).padStart(toolsW);
+    const timeStr = fmtDur(sa.duration_ms).padStart(timeW);
+
+    const rowColor = isRunning ? C.hdrValue : "\x1b[38;5;250m";
+    lines.push(
+      statusIcon + " " +
+      rowColor + typeStr + RESET + " " +
+      rowColor + modelStr + RESET + " " +
+      rowColor + descStr + RESET + " " +
+      rowColor + costStr + RESET + " " +
+      rowColor + toolsStr + RESET + " " +
+      rowColor + timeStr + RESET
+    );
+  }
+
+  while (lines.length < rows) lines.push("");
+  return lines;
+}
+
+// ---------------------------------------------------------------------------
 // Render: config panel
 // ---------------------------------------------------------------------------
 
@@ -5823,7 +6091,7 @@ function render(state) {
   const panelPlan = selected ? (selected.provider === "codex" ? state.codexPlan : state.claudePlan) : null;
   state._tabBarRow = screenLines.length + 1; // 1-based row of the tab bar
   state._configPanelTop = screenLines.length + 3; // 1-based: tab bar + rule line → first content row
-  const bottomLines = renderBottomPanels(selected, state.panelData, panelPlan, boxW, panelHeight, state.bottomTab, state.hoverTab, state);
+  const bottomLines = renderBottomPanels(selected, state.panelData, panelPlan, boxW, panelHeight, resolveActiveTab(state, state.panelData), state.hoverTab, state);
   for (const pl of bottomLines) screenLines.push(pl);
 
   // Limits panel (below bottom panels)
@@ -6173,13 +6441,17 @@ function columnScreenPos(colKey, hScroll, state) {
   return null;
 }
 
-/** Given a 1-based column, return which tab index (0-2) was clicked, or -1. */
-function tabAtX(col) {
+/** Given a 1-based column and the panel data (for visible-tab filtering), return the
+ *  static BOTTOM_TABS index that was clicked, or -1. Hidden conditional tabs are skipped
+ *  so click coordinates line up with what's actually drawn. */
+function tabAtX(col, data) {
+  const vis = visibleBottomTabs(data);
   let pos = 4; // skip ╭─ + space (1-based)
-  for (let i = 0; i < BOTTOM_TABS.length; i++) {
+  for (let i = 0; i < vis.length; i++) {
     if (i > 0) pos += 2; // 2-space gap between tabs
-    const w = BOTTOM_TABS[i].length;
-    if (col >= pos && col < pos + w) return i;
+    const staticIdx = vis[i];
+    const w = BOTTOM_TABS[staticIdx].length;
+    if (col >= pos && col < pos + w) return staticIdx;
     pos += w;
   }
   return -1;
@@ -6375,12 +6647,13 @@ function handleEvent(event, state) {
         case "P": setSortColumn(state, "status"); return;
         case "M": setSortColumn(state, "mem"); return;
         case "T": setSortColumn(state, "cost"); return;
-        case "1": state.bottomTab = 0; state.dirty = true; saveUiPrefs({ bottomTab: 0, listTab: state.listTab }); return;
-        case "2": state.bottomTab = 1; state.dirty = true; saveUiPrefs({ bottomTab: 1, listTab: state.listTab }); return;
-        case "3": state.bottomTab = 2; state.dirty = true; saveUiPrefs({ bottomTab: 2, listTab: state.listTab }); return;
-        case "4": state.bottomTab = 3; state.dirty = true; saveUiPrefs({ bottomTab: 3, listTab: state.listTab }); return;
-        case "5": state.bottomTab = 4; state.dirty = true; saveUiPrefs({ bottomTab: 4, listTab: state.listTab }); return;
-        case "6": state.bottomTab = 5; state.dirty = true; saveUiPrefs({ bottomTab: 5, listTab: state.listTab }); return;
+        case "1": selectBottomTabByNumber(state, 0); return;
+        case "2": selectBottomTabByNumber(state, 1); return;
+        case "3": selectBottomTabByNumber(state, 2); return;
+        case "4": selectBottomTabByNumber(state, 3); return;
+        case "5": selectBottomTabByNumber(state, 4); return;
+        case "6": selectBottomTabByNumber(state, 5); return;
+        case "7": selectBottomTabByNumber(state, 6); return;
         case "`": switchListTab(state); return;
         default: return;
       }
@@ -6390,9 +6663,7 @@ function handleEvent(event, state) {
       switchListTab(state);
       return;
     case "tab":
-      state.bottomTab = (state.bottomTab + 1) % BOTTOM_TABS.length;
-      state.dirty = true;
-      saveUiPrefs({ bottomTab: state.bottomTab, listTab: state.listTab });
+      cycleBottomTab(state, 1);
       return;
     case "f1": state.mode = "help"; state.dirty = true; return;
     case "f3": state.mode = "search"; state.dirty = true; return;
@@ -6465,6 +6736,8 @@ function handleEvent(event, state) {
         } else {
           if (state.agentToolScroll > 0) { state.agentToolScroll--; state.dirty = true; }
         }
+      } else if (state.bottomTab === 6 && state._configPanelTop && event.row >= state._configPanelTop) {
+        if ((state.subagentScroll || 0) > 0) { state.subagentScroll = (state.subagentScroll || 0) - 1; state.dirty = true; }
       } else {
         if (state.selectedRow > 0) { state.selectedRow--; state.dirty = true; }
       }
@@ -6485,6 +6758,8 @@ function handleEvent(event, state) {
         } else {
           state.agentToolScroll++; state.dirty = true; // clamped in render
         }
+      } else if (state.bottomTab === 6 && state._configPanelTop && event.row >= state._configPanelTop) {
+        state.subagentScroll = (state.subagentScroll || 0) + 1; state.dirty = true; // clamped in render
       } else {
         if (state.selectedRow < listLen - 1) { state.selectedRow++; state.dirty = true; }
       }
@@ -6520,7 +6795,7 @@ function handleEvent(event, state) {
               case "f3": state.mode = "search"; state.dirty = true; break;
               case "f5": state._needsRefresh = true; break;
               case "f6": openSortBy(state); break;
-              case "tab": state.bottomTab = (state.bottomTab + 1) % BOTTOM_TABS.length; state.dirty = true; saveUiPrefs({ bottomTab: state.bottomTab, listTab: state.listTab }); break;
+              case "tab": cycleBottomTab(state, 1); break;
               case "backtick": switchListTab(state); break;
               case "d_delete": { const sel = state.filtered[state.selectedRow]; if (sel && !sel.process) { state.mode = "delete"; state.dirty = true; } break; }
               case "f7": { const idx = INACTIVITY_OPTIONS.findIndex(o => o.key === state.inactivityFilter); state._inactivityCursor = idx >= 0 ? idx : INACTIVITY_OPTIONS.length - 1; state.mode = "inactivity"; state.dirty = true; break; }
@@ -6541,7 +6816,7 @@ function handleEvent(event, state) {
       }
       // Check if click is on the bottom tab bar (top border row or underline row)
       if (state._tabBarRow && (event.row === state._tabBarRow || event.row === state._tabBarRow + 1)) {
-        const tabIdx = tabAtX(event.col);
+        const tabIdx = tabAtX(event.col, state.panelData);
         if (tabIdx >= 0) {
           state.bottomTab = tabIdx;
           state.dirty = true;
@@ -6765,7 +7040,7 @@ function handleEvent(event, state) {
       // Track hover over bottom tab bar
       let newHover = -1;
       if (state._tabBarRow && (event.row === state._tabBarRow || event.row === state._tabBarRow + 1)) {
-        const idx = tabAtX(event.col);
+        const idx = tabAtX(event.col, state.panelData);
         if (idx >= 0) newHover = idx;
       }
       // Track hover over Live button in list tab bar
@@ -7245,6 +7520,9 @@ async function main() {
           }
           if (data && data.rates) {
             obj.rates = data.rates;
+          }
+          if (data && Array.isArray(data.subagents)) {
+            obj.subagents = data.subagents;
           }
           return obj;
         }));
