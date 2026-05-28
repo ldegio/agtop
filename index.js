@@ -3686,6 +3686,12 @@ function createState() {
     _costDragStartScroll: 0,
     configScroll: 0, // scroll offset in Config panel content
     subagentScroll: 0, // scroll offset in Subagents panel
+    // Per-surface sort: bottom Subagents panel and session-list expansion track
+    // independently so clicking one doesn't reshuffle the other.
+    subagentSortPanel: { col: "start", asc: false }, // bottom Subagents panel
+    subagentSortList:  { col: "start", asc: false }, // session-list expansion
+    _subagentColRanges: {},    // bottom panel header click ranges
+    _subagentExpColRanges: {}, // list expansion header click ranges
     expandedSubagents: new Set(), // session keys ("provider:session_id") with subagents expanded in the list
     flatList: [],     // virtual rows: [{type:"session"|"marker"|"subagent", session, subagent?, expanded?}]
     configSubTabHover: -1, // hover over config sub-tab
@@ -3888,6 +3894,37 @@ function sessionKey(s) {
   return `${s.provider}:${s.session_id}`;
 }
 
+/** Sortable subagent columns. Shared between the bottom Subagents panel and the
+ *  session-list expansion so a single state.subagentSort drives both surfaces.
+ *  `key` is what's stored in state, `extract` returns the comparable value. */
+const SUBAGENT_SORT_COLS = {
+  start: { extract: (sa) => sa.started_at || "" },
+  type:  { extract: (sa) => sa.type || "" },
+  model: { extract: (sa) => sa.model || "" },
+  desc:  { extract: (sa) => sa.description || "" },
+  cost:  { extract: (sa) => (typeof sa.cost === "number" ? sa.cost : Number(sa.cost) || 0) },
+  tools: { extract: (sa) => sa.tool_count || 0 },
+  ctx:   { extract: (sa) => sa.context ? (sa.context.used / (sa.context.max * COMPACT_THRESHOLD)) : -1 },
+  dur:   { extract: (sa) => sa.duration_ms || 0 },
+};
+
+/** Sort a list of subagents according to state.subagentSort, leaving the input untouched. */
+function sortSubagents(subs, sort) {
+  const col = (sort && sort.col) || "start";
+  const asc = !!(sort && sort.asc);
+  const def = SUBAGENT_SORT_COLS[col] || SUBAGENT_SORT_COLS.start;
+  const out = subs.slice();
+  out.sort((a, b) => {
+    const va = def.extract(a);
+    const vb = def.extract(b);
+    let cmp;
+    if (typeof va === "number" && typeof vb === "number") cmp = va - vb;
+    else cmp = String(va).localeCompare(String(vb));
+    return asc ? cmp : -cmp;
+  });
+  return out;
+}
+
 /** Build the virtual row list: each session, plus a marker + child rows when expanded. */
 function buildFlatList(state) {
   const flat = [];
@@ -3900,11 +3937,7 @@ function buildFlatList(state) {
       flat.push({ type: "marker", session: s, expanded: isExpanded, count: subs.length });
       if (isExpanded) {
         flat.push({ type: "subagent-header", session: s });
-        const sorted = subs.slice().sort((a, b) => {
-          if (a.status !== b.status) return a.status === "running" ? -1 : 1;
-          return (b.started_at || "").localeCompare(a.started_at || "");
-        });
-        for (const sa of sorted) flat.push({ type: "subagent", session: s, subagent: sa });
+        for (const sa of sortSubagents(subs, state.subagentSortList)) flat.push({ type: "subagent", session: s, subagent: sa });
       }
     }
   }
@@ -4405,13 +4438,15 @@ function renderSubagentChildRow(sa, isSelected, width, hScroll, state) {
   const icon = isGhost ? "◌" : (isRunning ? "●" : "○");
   const iconColor = isSelected ? "" : (isGhost ? C.dimText : (isRunning ? C.chartBarHi : C.dimText));
   const ts = sa.started_at ? new Date(sa.started_at) : null;
-  const startStr = (ts && !isNaN(ts.getTime()))
+  // 6-char column (matches the START header width): HH:MM left-aligned + trailing space.
+  const startStr = ((ts && !isNaN(ts.getTime()))
     ? String(ts.getHours()).padStart(2, "0") + ":" + String(ts.getMinutes()).padStart(2, "0")
-    : "  —  ".slice(0, 5);
+    : "  —  ".slice(0, 5)).padEnd(6);
   const cost = (isGhost || typeof sa.cost !== "number")
     ? "      —"   // 7-char column, right-aligned em-dash to match $N.NN values
     : ("$" + sa.cost.toFixed(2)).padStart(7);
-  const tools = (isGhost ? "    —" : String(sa.tool_count || 0).padStart(5));
+  // 6-char column (matches the TOOLS header): right-aligned numeric.
+  const tools = (isGhost ? "     —" : String(sa.tool_count || 0).padStart(6));
   const dur = (isGhost || !sa.duration_ms)
     ? "     —"
     : (() => {
@@ -4460,19 +4495,48 @@ function renderSubagentChildRow(sa, isSelected, width, hScroll, state) {
 
 /** Column-label row shown right after the expansion marker so subagent rows
  *  are self-describing. Aligns with renderSubagentChildRow's column widths.
- *  Uses the same bold-white-on-dark-gray style as the session-list header. */
+ *  Active sort column gets a ▲/▼; per-column click ranges are recorded for the
+ *  click handler to map clicks to sort keys. */
 function renderSubagentHeaderRow(isSelected, width, hScroll, state) {
   const bg = isSelected ? C.selBg : "";
   const fg = isSelected ? C.selFg : "";
   const base = bg + fg;
-  // 5sp indent + 1ch icon-placeholder + 1sp gap before headers begin.
-  const indent = "       ";
-  // 5ch START + 2sp + 6ch DUR + 2sp + 7ch COST + 2sp + 5ch TOOLS + 2sp + 12ch MODEL + 2sp + DESCRIPTION
-  const labels = "START" + "  " + "   DUR" + "  " + "   COST" + "  " + "TOOLS" + "  " + "MODEL       " + "  " + "DESCRIPTION";
+  const indent = "       "; // 5sp indent + 1ch icon-placeholder + 1sp gap
+  const sort = state.subagentSortList || { col: "start", asc: false };
+  const arrow = (k) => k === sort.col ? (sort.asc ? "▲" : "▼") : "";
+  // Each column width ≥ label.length + 1 so the active sort's ▲/▼ fits next to
+  // the label without ever cropping it. Data cells in renderSubagentChildRow
+  // pad to the same widths so columns stay aligned.
+  const segs = [
+    { key: "start", text: "START",       width: 6,  align: "left",  gap: 2 },
+    { key: "dur",   text: "DUR",         width: 6,  align: "right", gap: 2 },
+    { key: "cost",  text: "COST",        width: 7,  align: "right", gap: 2 },
+    { key: "tools", text: "TOOLS",       width: 6,  align: "right", gap: 2 },
+    { key: "model", text: "MODEL",       width: 12, align: "left",  gap: 2 },
+    { key: "desc",  text: "DESCRIPTION", width: 12, align: "left",  gap: 0 },
+  ];
+  const ranges = {};
+  let labelsStr = "";
+  let col = indent.length;
+  for (const s of segs) {
+    // Trim the label (not the arrow) when label+arrow would overflow the column.
+    const a = arrow(s.key);
+    const labelMax = Math.max(0, s.width - a.length);
+    const labelText = s.text.length > labelMax ? s.text.slice(0, labelMax) : s.text;
+    const cellRaw = labelText + a;
+    const cell = s.align === "right"
+      ? cellRaw.padStart(s.width)
+      : cellRaw.padEnd(s.width);
+    ranges[s.key] = [col, col + s.width - 1];
+    labelsStr += cell;
+    col += s.width;
+    if (s.gap > 0) { labelsStr += " ".repeat(s.gap); col += s.gap; }
+  }
+  state._subagentExpColRanges = ranges;
   const headerStyle = isSelected ? "" : C.colHdrBg;
   // No intermediate RESET so ansiSlice's trailing-space padding inherits the bg
   // and the header bar extends across the full row.
-  const line = base + headerStyle + indent + labels;
+  const line = base + headerStyle + indent + labelsStr;
   return base + ansiSlice(line, hScroll, width) + RESET;
 }
 
@@ -5704,19 +5768,16 @@ function renderSubagentsPanel(session, data, panelW, rows, state) {
   }
 
   // Running first; within each status group, newest started_at first.
-  list.sort((a, b) => {
-    if (a.status !== b.status) return a.status === "running" ? -1 : 1;
-    const aTs = a.started_at || "";
-    const bTs = b.started_at || "";
-    return bTs.localeCompare(aTs);
-  });
+  const sortedList = sortSubagents(list, state.subagentSortPanel);
 
-  // Column widths (status icon is 1 col wide; we add a trailing space after each column)
-  const startW = 5;  // "HH:MM" — when the parent's Agent tool_use was dispatched
+  // Column widths (status icon is 1 col wide; we add a trailing space after each column).
+  // Widths are sized so the active sort's ▲/▼ arrow always fits next to the label
+  // without truncating it: each width ≥ labelLen + 1.
+  const startW = 6;  // "HH:MM" + 1 spare for the arrow
   const typeW = 12;
   const modelW = 12;
   const costW = 7;   // up to "$999.99"
-  const toolsW = 5;  // up to 99999
+  const toolsW = 6;  // up to 99999 + 1 spare for the arrow
   const ctxW = 4;    // "100%"
   const timeW = 7;   // "MM:SS", "Xm SSs", "Xh YYm"
   const fixedW = startW + 1 + 1 + 1 + typeW + 1 + modelW + 1 + 1 + costW + 1 + toolsW + 1 + ctxW + 1 + timeW;
@@ -5726,7 +5787,8 @@ function renderSubagentsPanel(session, data, panelW, rows, state) {
     if (!ts) return "—".padStart(startW);
     const d = new Date(ts);
     if (isNaN(d.getTime())) return "?".padStart(startW);
-    return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+    const t = String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+    return t.padEnd(startW);
   };
 
   const shortModel = (m) => (m || "?")
@@ -5755,28 +5817,54 @@ function renderSubagentsPanel(session, data, panelW, rows, state) {
   // Header row — uses the same bold-white-on-dark-gray style as the session list
   // column header (C.colHdrBg). No trailing RESET so boxLine's ansiSlice pads the
   // remainder of the row with bg-bearing spaces, extending the bar to full width.
+  // Active sort column gets a ▲/▼ arrow. Per-column click ranges are recorded so
+  // the click handler can map a mouse col → sort key.
   const hdr = C.colHdrBg;
-  lines.push(
-    hdr + "START".padEnd(startW) +
-    "   " +
-    truncate("TYPE", typeW).padEnd(typeW) + " " +
-    truncate("MODEL", modelW).padEnd(modelW) + " " +
-    truncate("DESCRIPTION", descW).padEnd(descW) + " " +
-    "COST".padStart(costW) + " " +
-    "TOOLS".padStart(toolsW) + " " +
-    "CTX".padStart(ctxW) + " " +
-    "TIME".padStart(timeW)
-  );
+  const sort = state.subagentSortPanel || { col: "start", asc: false };
+  const arrow = (k) => k === sort.col ? (sort.asc ? "▲" : "▼") : "";
+  const ranges = {};
+  // Each segment: { key, text, width, align ("left"|"right"), gap (chars after) }
+  const segs = [
+    { key: "start", text: "START", width: startW, align: "left",  gap: 3 },
+    { key: "type",  text: "TYPE",  width: typeW,  align: "left",  gap: 1 },
+    { key: "model", text: "MODEL", width: modelW, align: "left",  gap: 1 },
+    { key: "desc",  text: "DESC",  width: descW,  align: "left",  gap: 1 },
+    { key: "cost",  text: "COST",  width: costW,  align: "right", gap: 1 },
+    { key: "tools", text: "TOOLS", width: toolsW, align: "right", gap: 1 },
+    { key: "ctx",   text: "CTX",   width: ctxW,   align: "right", gap: 1 },
+    { key: "dur",   text: "TIME",  width: timeW,  align: "right", gap: 0 },
+  ];
+  let headerLine = hdr;
+  let col = 0;
+  for (const s of segs) {
+    // Trim the LABEL (not the arrow) when label+arrow would overflow the column.
+    // Slicing the combined string from the left ate the arrow on columns where
+    // the label was exactly column-width long (START, TOOLS), so the sort arrow
+    // flickered: visible for some columns, missing for others.
+    const a = arrow(s.key);
+    const labelMax = Math.max(0, s.width - a.length);
+    const labelText = s.text.length > labelMax ? s.text.slice(0, labelMax) : s.text;
+    const cellRaw = labelText + a;
+    const cell = s.align === "right"
+      ? cellRaw.padStart(s.width)
+      : cellRaw.padEnd(s.width);
+    ranges[s.key] = [col, col + s.width - 1]; // inclusive char range within the panel inner area
+    headerLine += cell;
+    col += s.width;
+    if (s.gap > 0) { headerLine += " ".repeat(s.gap); col += s.gap; }
+  }
+  state._subagentColRanges = ranges;
+  lines.push(headerLine);
 
   // Scroll handling (auto-clamp; default top)
   if (state.subagentScroll === undefined) state.subagentScroll = 0;
   if (state.subagentScroll < 0) state.subagentScroll = 0;
   const visibleRows = Math.max(0, rows - 1);
-  const maxScroll = Math.max(0, list.length - visibleRows);
+  const maxScroll = Math.max(0, sortedList.length - visibleRows);
   if (state.subagentScroll > maxScroll) state.subagentScroll = maxScroll;
 
   for (let i = 0; i < visibleRows; i++) {
-    const sa = list[i + state.subagentScroll];
+    const sa = sortedList[i + state.subagentScroll];
     if (!sa) { lines.push(""); continue; }
     const isRunning = sa.status === "running";
     const isGhost = sa.ghost === true;
@@ -7399,6 +7487,22 @@ function handleEvent(event, state) {
           return;
         }
       }
+      // Check if click is in Subagents panel header (sort) — bottomTab 6
+      if (state.bottomTab === 6 && state._configPanelTop && event.row === state._configPanelTop) {
+        const innerCol = event.col - 3; // border "│ " + 1-based → 0-based inner column
+        const ranges = state._subagentColRanges || {};
+        for (const k of Object.keys(ranges)) {
+          const [a, b] = ranges[k];
+          if (innerCol >= a && innerCol <= b) {
+            const cur = state.subagentSortPanel || { col: "start", asc: false };
+            if (cur.col === k) state.subagentSortPanel = { col: k, asc: !cur.asc };
+            else state.subagentSortPanel = { col: k, asc: k === "start" ? false : true };
+            saveUiPrefs({ subagentSortPanel: state.subagentSortPanel });
+            state.dirty = true;
+            return;
+          }
+        }
+      }
       // Check if click is in Cost panel scrollbar
       if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
@@ -7480,10 +7584,28 @@ function handleEvent(event, state) {
         if (rowIdx >= 0 && rowIdx < listLen) {
           state.selectedRow = rowIdx;
           state.dirty = true;
-          // Clicking the marker (or its sub-header) toggles expansion immediately
-          // on the first click — the chevron is the marker's primary affordance.
           const r = state.flatList[rowIdx];
-          if (r && (r.type === "marker" || r.type === "subagent-header")) {
+          // Sub-header row: a click on a column label sets the sort; clicks
+          // anywhere else on the row leave selection only (the marker above is
+          // the primary affordance to collapse).
+          if (r && r.type === "subagent-header") {
+            const innerCol = event.col - 2; // 1-based column → 0-based (the list area starts at col 2)
+            const ranges = state._subagentExpColRanges || {};
+            for (const k of Object.keys(ranges)) {
+              const [a, b] = ranges[k];
+              if (innerCol >= a && innerCol <= b) {
+                const cur = state.subagentSortList || { col: "start", asc: false };
+                if (cur.col === k) state.subagentSortList = { col: k, asc: !cur.asc };
+                else state.subagentSortList = { col: k, asc: k === "start" ? false : true };
+                saveUiPrefs({ subagentSortList: state.subagentSortList });
+                state.flatList = buildFlatList(state);
+                return;
+              }
+            }
+            return;
+          }
+          // Clicking the marker toggles expansion immediately on the first click.
+          if (r && r.type === "marker") {
             const s = r.session;
             if (state.expandedSubagents.has(sessionKey(s))) state.expandedSubagents.delete(sessionKey(s));
             else state.expandedSubagents.add(sessionKey(s));
@@ -8013,6 +8135,14 @@ async function main() {
   if (typeof _savedPrefs.bottomTab === "number") state.bottomTab = _savedPrefs.bottomTab;
   if (typeof _savedPrefs.listTab === "number") state.listTab = _savedPrefs.listTab;
   if (typeof _savedPrefs.agentLiveFilter === "boolean") state.agentLiveFilter = _savedPrefs.agentLiveFilter;
+  const restoreSort = (saved) =>
+    saved && typeof saved === "object" && typeof saved.col === "string" && SUBAGENT_SORT_COLS[saved.col]
+      ? { col: saved.col, asc: !!saved.asc }
+      : null;
+  const sp = restoreSort(_savedPrefs.subagentSortPanel);
+  if (sp) state.subagentSortPanel = sp;
+  const sl = restoreSort(_savedPrefs.subagentSortList);
+  if (sl) state.subagentSortList = sl;
   if (_savedPrefs.inactivityFilter !== undefined) {
     state.inactivityFilter = _savedPrefs.inactivityFilter || null;
     const idx = INACTIVITY_OPTIONS.findIndex(o => o.key === state.inactivityFilter);
