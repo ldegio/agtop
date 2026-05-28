@@ -4437,9 +4437,21 @@ function renderSubagentChildRow(sa, isSelected, width, hScroll, state) {
   const costNum = typeof sa.cost === "number" ? sa.cost : Number(sa.cost) || 0;
   const costCol  = isSelected || isGhost ? rowColor : costColor(costNum);
   const modelCol = isSelected || isGhost ? rowColor : modelColor({ model: sa.model || "" });
+  // START column mirrors the parent's LAST column: ageDimColor on dispatch time.
+  const startCol = isSelected || isGhost
+    ? rowColor
+    : ageDimColor({ last_active: sa.started_at, process: isRunning }, new Date());
+  // DUR thresholds: ≤10m row color, >10m yellow, >30m red.
+  const durMs = sa.duration_ms || 0;
+  const durCol = isSelected || isGhost
+    ? rowColor
+    : durMs > 1800000 ? C.costRed
+    : durMs > 600000  ? C.costYellow
+    : rowColor;
   const line = base + " ".repeat(5) + (iconColor || "") + icon + RESET + base +
-    rowColor + ` ${startStr}  ${dur}  ` + RESET + base +
-    costCol + cost + RESET + base +
+    " " + startCol + startStr + RESET + base +
+    "  " + durCol + dur + RESET + base +
+    "  " + costCol + cost + RESET + base +
     rowColor + `  ${tools}  ` + RESET + base +
     modelCol + modelCell + RESET + base +
     rowColor + `  ${descShort}` + RESET + base;
@@ -5805,9 +5817,20 @@ function renderSubagentsPanel(session, data, panelW, rows, state) {
       : ctxPct > 0  ? C.chartBarLow
       : C.dimText;
     const modelColForCol = isGhost ? rowColor : modelColor({ model: sa.model || "" });
+    // START column mirrors the parent's LAST column: ageDimColor on dispatch time.
+    const startColForCol = isGhost
+      ? C.dimText
+      : ageDimColor({ last_active: sa.started_at, process: isRunning }, new Date());
+    // DUR/TIME thresholds: ≤10m row color, >10m yellow, >30m red.
+    const durMs = sa.duration_ms || 0;
+    const timeColForCol = isGhost
+      ? rowColor
+      : durMs > 1800000 ? C.costRed
+      : durMs > 600000  ? C.costYellow
+      : rowColor;
     const startStr = fmtStart(sa.started_at);
     lines.push(
-      C.dimText + startStr + RESET + " " +
+      startColForCol + startStr + RESET + " " +
       statusIcon + " " +
       rowColor + typeStr + RESET + " " +
       modelColForCol + modelStr + RESET + " " +
@@ -5815,7 +5838,7 @@ function renderSubagentsPanel(session, data, panelW, rows, state) {
       costColForCol + costStr + RESET + " " +
       rowColor + toolsStr + RESET + " " +
       ctxColForCol + ctxStr + RESET + " " +
-      rowColor + timeStr + RESET
+      timeColForCol + timeStr + RESET
     );
   }
 
