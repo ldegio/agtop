@@ -7455,12 +7455,12 @@ function handleEvent(event, state) {
         // Click on a virtual row (session, marker, or subagent)
         const rowIdx = state.scrollOffset + (event.row - state._colHeaderRow - 1);
         if (rowIdx >= 0 && rowIdx < listLen) {
-          // Same-row click on a marker toggles expansion; otherwise just selects.
-          const wasSelected = rowIdx === state.selectedRow;
           state.selectedRow = rowIdx;
           state.dirty = true;
+          // Clicking the marker (or its sub-header) toggles expansion immediately
+          // on the first click — the chevron is the marker's primary affordance.
           const r = state.flatList[rowIdx];
-          if (r && r.type === "marker" && wasSelected) {
+          if (r && (r.type === "marker" || r.type === "subagent-header")) {
             const s = r.session;
             if (state.expandedSubagents.has(sessionKey(s))) state.expandedSubagents.delete(sessionKey(s));
             else state.expandedSubagents.add(sessionKey(s));
