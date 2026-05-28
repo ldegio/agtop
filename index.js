@@ -7192,10 +7192,20 @@ function handleEvent(event, state) {
       const s = flatRow.session;
       if (state.expandedSubagents.has(sessionKey(s))) {
         state.expandedSubagents.delete(sessionKey(s));
-        // Move selection up to the parent session row (it may have moved indexes after collapse)
         state.flatList = buildFlatList(state);
-        const parentIdx = state.flatList.findIndex(r => r.type === "session" && r.session === s);
-        if (parentIdx >= 0) state.selectedRow = parentIdx;
+        // Pick the post-collapse selection target:
+        // - session row → stay on the session row
+        // - marker row (the fold/unfold affordance, still present after collapse) → stay on it
+        // - sub-header / subagent rows (removed by collapse) → land on the marker so
+        //   the user can press Right again to re-expand from the same place
+        let target = -1;
+        if (flatRow.type === "session") {
+          target = state.flatList.findIndex(r => r.type === "session" && r.session === s);
+        } else {
+          target = state.flatList.findIndex(r => r.type === "marker" && r.session === s);
+          if (target < 0) target = state.flatList.findIndex(r => r.type === "session" && r.session === s);
+        }
+        if (target >= 0) state.selectedRow = target;
         state.dirty = true;
         return;
       }
