@@ -4427,25 +4427,40 @@ function renderSubagentChildRow(sa, isSelected, width, hScroll, state) {
   const desc = sa.description || "(no description)";
   const model = (sa.model || "?").replace(/^claude-/, "").replace(/-\d{8}$/, "");
   // Layout: "     ◌ 10:18  3m12s  $0.42   142  haiku-4-5     Implement Task 1"
-  const prefix = `     ${icon} ${startStr}  ${dur}  ${cost}  ${tools}  ${(model.length > 12 ? model.slice(0, 11) + "…" : model).padEnd(12)}  `;
+  const modelCell = (model.length > 12 ? model.slice(0, 11) + "…" : model).padEnd(12);
+  const prefix = `     ${icon} ${startStr}  ${dur}  ${cost}  ${tools}  ${modelCell}  `;
   const maxDesc = Math.max(8, width - 2 - prefix.replace(/\x1b\[[^m]*m/g, "").length);
   const descShort = desc.length > maxDesc ? desc.slice(0, maxDesc - 1) + "…" : desc;
   const rowColor = isSelected ? "" : (isGhost ? C.dimText : "\x1b[38;5;250m");
+  // Match the parent session row's per-column color rules. When selected, keep
+  // the selection foreground (no override) so the highlight remains readable.
+  const costNum = typeof sa.cost === "number" ? sa.cost : Number(sa.cost) || 0;
+  const costCol  = isSelected || isGhost ? rowColor : costColor(costNum);
+  const modelCol = isSelected || isGhost ? rowColor : modelColor({ model: sa.model || "" });
   const line = base + " ".repeat(5) + (iconColor || "") + icon + RESET + base +
-    rowColor + ` ${startStr}  ${dur}  ${cost}  ${tools}  ${(model.length > 12 ? model.slice(0, 11) + "…" : model).padEnd(12)}  ${descShort}` + RESET + base;
+    rowColor + ` ${startStr}  ${dur}  ` + RESET + base +
+    costCol + cost + RESET + base +
+    rowColor + `  ${tools}  ` + RESET + base +
+    modelCol + modelCell + RESET + base +
+    rowColor + `  ${descShort}` + RESET + base;
   return base + ansiSlice(line, hScroll, width) + RESET;
 }
 
 /** Column-label row shown right after the expansion marker so subagent rows
- *  are self-describing. Aligns with renderSubagentChildRow's column widths. */
+ *  are self-describing. Aligns with renderSubagentChildRow's column widths.
+ *  Uses the same bold-white-on-dark-gray style as the session-list header. */
 function renderSubagentHeaderRow(isSelected, width, hScroll, state) {
   const bg = isSelected ? C.selBg : "";
   const fg = isSelected ? C.selFg : "";
   const base = bg + fg;
-  const dim = isSelected ? "" : C.dimText;
-  // 5sp indent + 1ch icon + 1sp + 5ch START + 2sp + 6ch DUR + 2sp + 7ch COST + 2sp + 5ch TOOLS + 2sp + 12ch MODEL + 2sp + DESCRIPTION
-  const labels = "     " + " " + " " + "START" + "  " + "   DUR" + "  " + "   COST" + "  " + "TOOLS" + "  " + "MODEL       " + "  " + "DESCRIPTION";
-  const line = base + dim + labels + RESET + base;
+  // 5sp indent + 1ch icon-placeholder + 1sp gap before headers begin.
+  const indent = "       ";
+  // 5ch START + 2sp + 6ch DUR + 2sp + 7ch COST + 2sp + 5ch TOOLS + 2sp + 12ch MODEL + 2sp + DESCRIPTION
+  const labels = "START" + "  " + "   DUR" + "  " + "   COST" + "  " + "TOOLS" + "  " + "MODEL       " + "  " + "DESCRIPTION";
+  const headerStyle = isSelected ? "" : C.colHdrBg;
+  // No intermediate RESET so ansiSlice's trailing-space padding inherits the bg
+  // and the header bar extends across the full row.
+  const line = base + headerStyle + indent + labels;
   return base + ansiSlice(line, hScroll, width) + RESET;
 }
 
@@ -5725,18 +5740,20 @@ function renderSubagentsPanel(session, data, panelW, rows, state) {
     return s.slice(0, Math.max(1, n - 1)) + "…";
   };
 
-  // Header row
-  const hdr = "\x1b[38;5;245m";
+  // Header row — uses the same bold-white-on-dark-gray style as the session list
+  // column header (C.colHdrBg). No trailing RESET so boxLine's ansiSlice pads the
+  // remainder of the row with bg-bearing spaces, extending the bar to full width.
+  const hdr = C.colHdrBg;
   lines.push(
-    hdr + "START".padEnd(startW) + RESET + " " +
-    " " + " " +
-    hdr + truncate("TYPE", typeW).padEnd(typeW) + RESET + " " +
-    hdr + truncate("MODEL", modelW).padEnd(modelW) + RESET + " " +
-    hdr + truncate("DESCRIPTION", descW).padEnd(descW) + RESET + " " +
-    hdr + "COST".padStart(costW) + RESET + " " +
-    hdr + "TOOLS".padStart(toolsW) + RESET + " " +
-    hdr + "CTX".padStart(ctxW) + RESET + " " +
-    hdr + "TIME".padStart(timeW) + RESET
+    hdr + "START".padEnd(startW) +
+    "   " +
+    truncate("TYPE", typeW).padEnd(typeW) + " " +
+    truncate("MODEL", modelW).padEnd(modelW) + " " +
+    truncate("DESCRIPTION", descW).padEnd(descW) + " " +
+    "COST".padStart(costW) + " " +
+    "TOOLS".padStart(toolsW) + " " +
+    "CTX".padStart(ctxW) + " " +
+    "TIME".padStart(timeW)
   );
 
   // Scroll handling (auto-clamp; default top)
@@ -5772,23 +5789,32 @@ function renderSubagentsPanel(session, data, panelW, rows, state) {
     const toolsStr = (isGhost ? "—"  : String(sa.tool_count || 0)).padStart(toolsW);
     // CTX% against the model's compact threshold (same formula as the parent CTX column).
     const ctx = sa.context;
+    const ctxPct = ctx ? (ctx.used / (ctx.max * COMPACT_THRESHOLD)) * 100 : 0;
     const ctxStr = (isGhost || !ctx)
       ? "—".padStart(ctxW)
-      : (Math.round((ctx.used / (ctx.max * COMPACT_THRESHOLD)) * 100) + "%").padStart(ctxW);
+      : (Math.round(ctxPct) + "%").padStart(ctxW);
     const timeStr  = (isGhost ? "—"  : fmtDur(sa.duration_ms)).padStart(timeW);
 
     // Ghost rows are dimmed overall; live rows use brighter row color when running.
     const rowColor = isGhost ? C.dimText : (isRunning ? C.hdrValue : "\x1b[38;5;250m");
+    // Match the parent session row's per-column color rules where they apply.
+    const costColForCol = isGhost ? rowColor : costColor(costNum);
+    const ctxColForCol = isGhost || !ctx ? C.dimText
+      : ctxPct > 85 ? C.costRed
+      : ctxPct > 65 ? C.costYellow
+      : ctxPct > 0  ? C.chartBarLow
+      : C.dimText;
+    const modelColForCol = isGhost ? rowColor : modelColor({ model: sa.model || "" });
     const startStr = fmtStart(sa.started_at);
     lines.push(
       C.dimText + startStr + RESET + " " +
       statusIcon + " " +
       rowColor + typeStr + RESET + " " +
-      rowColor + modelStr + RESET + " " +
+      modelColForCol + modelStr + RESET + " " +
       rowColor + descStr + RESET + " " +
-      rowColor + costStr + RESET + " " +
+      costColForCol + costStr + RESET + " " +
       rowColor + toolsStr + RESET + " " +
-      rowColor + ctxStr + RESET + " " +
+      ctxColForCol + ctxStr + RESET + " " +
       rowColor + timeStr + RESET
     );
   }
