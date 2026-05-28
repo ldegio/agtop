@@ -1399,13 +1399,28 @@ async function extractClaudeSessionData(transcriptPath) {
   const CMD_RE = /<command-name>\/?([^<]+)<\/command-name>/g;
 
   const transcriptFiles = claudeTranscriptFiles(transcriptPath);
+  // Per-subagent-file accumulators (one entry per non-main file)
+  const subagentStats = new Map(); // filePath → { cost, tool_count, first_ts, last_ts, last_model, latest_used, latest_used_ts }
+  for (const fp of transcriptFiles.slice(1)) {
+    subagentStats.set(fp, { cost: 0, tool_count: 0, first_ts: null, last_ts: null, last_model: null, latest_used: 0, latest_used_ts: "" });
+  }
+  // Agent tool_use blocks in the main file and their matching tool_results (for status detection)
+  const agentToolUses = new Map(); // tool_use_id → { description, subagent_type, model, ts }
+  const agentResults = new Set();  // tool_use_ids that have a tool_result in the main file
   for (const [fileIdx, filePath] of transcriptFiles.entries()) {
     const isMainFile = fileIdx === 0;
+    const fileStats = isMainFile ? null : subagentStats.get(filePath);
     // Map of requestId → latest token snapshot (streaming writes same requestId multiple times;
     // the last entry has final token counts — keep that one, discard earlier partials).
     const lastByKey = new Map();
     // Keyless entries (no requestId/messageId) accumulate immediately.
     await forEachJsonl(filePath, (item) => {
+      // Per-subagent activity tracking (any entry with a timestamp counts as activity)
+      if (fileStats && item.timestamp) {
+        if (!fileStats.first_ts || item.timestamp < fileStats.first_ts) fileStats.first_ts = item.timestamp;
+        if (!fileStats.last_ts  || item.timestamp > fileStats.last_ts)  fileStats.last_ts  = item.timestamp;
+      }
+
       // --- System branch: accumulate API duration ---
       if (item.type === "system" && item.subtype === "turn_duration" && item.durationMs) {
         metrics.api_duration_ms += item.durationMs;
@@ -1442,6 +1457,10 @@ async function extractClaudeSessionData(transcriptPath) {
           for (const block of content) {
             if (typeof block === "string") texts.push(block);
             else if (block && typeof block.text === "string") texts.push(block.text);
+            // Track Agent tool_result ids (main file only) for subagent status detection
+            if (isMainFile && block && block.type === "tool_result" && block.tool_use_id) {
+              agentResults.add(block.tool_use_id);
+            }
           }
         }
         for (const text of texts) {
@@ -1474,6 +1493,19 @@ async function extractClaudeSessionData(transcriptPath) {
           }
           metrics.tools[name] = (metrics.tools[name] || 0) + 1;
           metrics.tool_count++;
+
+          // Track Agent tool_use blocks in main file (for subagent status + description fallback)
+          if (isMainFile && name === "Agent" && block.id) {
+            const inp = block.input || {};
+            agentToolUses.set(block.id, {
+              description: inp.description || "",
+              subagent_type: inp.subagent_type || "",
+              model: inp.model || "",
+              ts: item.timestamp || "",
+            });
+          }
+          // Per-subagent tool count (tools the subagent itself invoked)
+          if (fileStats) fileStats.tool_count++;
 
           // Per-tool invocation detail with timestamp
           const input = block.input || {};
@@ -1537,6 +1569,16 @@ async function extractClaudeSessionData(transcriptPath) {
           `Encountered billable Claude usage with unknown model in ${filePath}`
         );
 
+      // Track the latest cumulative context usage for this subagent (input + cache).
+      // Streaming partials share a requestId; we pick the latest-timestamped entry.
+      if (fileStats) {
+        const ts = item.timestamp || "";
+        if (!fileStats.latest_used_ts || ts >= fileStats.latest_used_ts) {
+          fileStats.latest_used = inputTokens + cacheReadTokens + totalCacheWriteTokens;
+          fileStats.latest_used_ts = ts;
+        }
+      }
+
       const key = requestKey(item, message);
       const snapshot = { inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, model, ts: item.timestamp || "" };
       if (key !== null) {
@@ -1544,16 +1586,16 @@ async function extractClaudeSessionData(transcriptPath) {
         // the final entry has the highest (correct) token counts.
         lastByKey.set(key, snapshot);
       } else {
-        accum(model, inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, item.timestamp || "", isMainFile);
+        accum(filePath, model, inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, item.timestamp || "", isMainFile);
       }
     });
     // Flush the last-occurrence map for this file
     for (const { inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, model, ts } of lastByKey.values()) {
-      accum(model, inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, ts, isMainFile);
+      accum(filePath, model, inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, ts, isMainFile);
     }
   }
 
-  function accum(model, inp, cacheR, out, cw5m, cw1h, ts, isMain) {
+  function accum(filePath, model, inp, cacheR, out, cw5m, cw1h, ts, isMain) {
     lastModel = model;
     if (isMain) lastMainModel = model;
     models[model] = (models[model] || 0) + 1;
@@ -1595,6 +1637,19 @@ async function extractClaudeSessionData(transcriptPath) {
       costsByDay[dateKey][model]  = (costsByDay[dateKey][model]  || 0) + callCost;
       costsByHour[hourKey][model] = (costsByHour[hourKey][model] || 0) + callCost;
     }
+    // Per-subagent cost + last-model tracking
+    if (!isMain) {
+      const stats = subagentStats.get(filePath);
+      if (stats) {
+        const callCost2 = tokenCost(inp, pricing.input_per_million) +
+          tokenCost(cacheR, pricing.cache_read_per_million) +
+          tokenCost(out, pricing.output_per_million) +
+          tokenCost(cw5m, pricing.cache_write_5m_per_million) +
+          tokenCost(cw1h, pricing.cache_write_1h_per_million);
+        stats.cost += callCost2;
+        stats.last_model = model;
+      }
+    }
   }
 
   if (!Object.keys(models).length)
@@ -1612,6 +1667,115 @@ async function extractClaudeSessionData(transcriptPath) {
     const modelTotal = Object.values(c).reduce((a, b) => a + b, 0);
     return { model, tokens: t, costs: c, total: money(modelTotal) };
   });
+
+  // Build per-subagent summary (one entry per file in <stem>/subagents/)
+  const subagents = [];
+  const nowMs = Date.now();
+  for (const fp of transcriptFiles.slice(1)) {
+    const stats = subagentStats.get(fp) || {};
+    const agentFile = basename(fp);                          // "agent-XXXX.jsonl"
+    const agentId = agentFile.replace(/\.jsonl$/, "");        // "agent-XXXX"
+    const metaPath = fp.replace(/\.jsonl$/, ".meta.json");
+    let meta = {};
+    try { meta = JSON.parse(readFileSync(metaPath, "utf-8")); } catch { /* missing sidecar */ }
+    const toolUseId = meta.toolUseId || null;
+    const parentUse = toolUseId ? agentToolUses.get(toolUseId) : null;
+    const type = meta.agentType || (parentUse && parentUse.subagent_type) || "?";
+    const description = meta.description || (parentUse && parentUse.description) || "";
+    const model = stats.last_model || (parentUse && parentUse.model) || "?";
+    let fileMtimeMs = 0;
+    try { fileMtimeMs = statSync(fp).mtime.getTime(); } catch {}
+    const lastTsMs = stats.last_ts ? new Date(stats.last_ts).getTime() : 0;
+    const firstTsMs = stats.first_ts ? new Date(stats.first_ts).getTime() : 0;
+    const lastActiveMs = Math.max(fileMtimeMs, lastTsMs);
+    const durationMs = (firstTsMs && lastTsMs) ? Math.max(0, lastTsMs - firstTsMs) : 0;
+    // Status: prefer parent tool_result presence; fall back to recency when no tool_use_id known.
+    let status;
+    if (toolUseId) {
+      status = agentResults.has(toolUseId) ? "done" : "running";
+    } else {
+      status = (nowMs - lastActiveMs < 30000) ? "running" : "done";
+    }
+    // Per-subagent context usage: total of the latest assistant message, against
+    // the model's max input window. Subagents have their own isolated contexts
+    // independent of the parent, so we compute from the subagent's own usage.
+    // Use usage-based inference for the max (same fallback the parent uses when
+    // no project settings are pinned) — LiteLLM reports 1M for any model that
+    // *can* do 1M with the [1m] beta header, which over-estimates the window
+    // for the common 200k-default case and made some subagents show single-digit
+    // CTX% next to their parent's normal 25-50% reading on the same usage.
+    let context = null;
+    if (stats.latest_used > 0) {
+      const maxCtx = stats.latest_used > 200000 ? 1_048_576 : 200000;
+      context = { used: stats.latest_used, max: maxCtx };
+    }
+
+    subagents.push({
+      agent_id: agentId,
+      type,
+      description,
+      model,
+      started_at: stats.first_ts || null,
+      last_active: stats.last_ts || null,
+      duration_ms: durationMs,
+      status,
+      cost: stats.cost || 0,
+      tool_count: stats.tool_count || 0,
+      tool_use_id: toolUseId,
+      context,
+      ghost: false,
+    });
+  }
+
+  // Fallback pairing: on-disk subagents whose meta.json lacked toolUseId (older
+  // Explore agents) still match a real Agent tool_use in the parent. Pair them by
+  // description (closest started_at wins on ties) so we don't synthesize a ghost
+  // for the same subagent. Each parent tool_use can be claimed at most once.
+  const seenToolUseIds = new Set(subagents.map(s => s.tool_use_id).filter(Boolean));
+  const unclaimedOnDisk = subagents.filter(s => !s.tool_use_id);
+  if (unclaimedOnDisk.length > 0 && agentToolUses.size > 0) {
+    for (const sa of unclaimedOnDisk) {
+      let best = null;
+      let bestDelta = Infinity;
+      const saTs = sa.started_at ? new Date(sa.started_at).getTime() : null;
+      for (const [tuId, use] of agentToolUses) {
+        if (seenToolUseIds.has(tuId)) continue;
+        if ((use.description || "") !== (sa.description || "")) continue;
+        const useTs = use.ts ? new Date(use.ts).getTime() : null;
+        const delta = (saTs !== null && useTs !== null) ? Math.abs(saTs - useTs) : 0;
+        if (delta < bestDelta) { best = tuId; bestDelta = delta; }
+      }
+      if (best) {
+        sa.tool_use_id = best;
+        const use = agentToolUses.get(best);
+        // Now that we know the parent tool_use, prefer its data where ours was guessed
+        sa.status = agentResults.has(best) ? "done" : sa.status;
+        if (!sa.type || sa.type === "?") sa.type = use.subagent_type || sa.type;
+        seenToolUseIds.add(best);
+      }
+    }
+  }
+
+  // Ghost subagents: parent Agent tool_use blocks whose on-disk transcript is gone
+  // (Claude Code purges old subagent jsonl files but keeps the tool_use/tool_result
+  // pair in the parent transcript). Synthesize a row with the metadata we still have.
+  for (const [tuId, use] of agentToolUses) {
+    if (seenToolUseIds.has(tuId)) continue;
+    subagents.push({
+      agent_id: tuId,
+      type: use.subagent_type || "?",
+      description: use.description || "",
+      model: use.model || "?",
+      started_at: use.ts || null,
+      last_active: null,
+      duration_ms: 0,
+      status: agentResults.has(tuId) ? "done" : "running",
+      cost: 0,
+      tool_count: 0,
+      tool_use_id: tuId,
+      ghost: true,
+    });
+  }
 
   return {
     provider: "claude",
@@ -1633,8 +1797,14 @@ async function extractClaudeSessionData(transcriptPath) {
     costsByDay,
     costsByHour,
     metrics,
+    subagents,
     _localDates: true,
     _noSubagentModel: true, // cache bust: lastModel now excludes subagent sidechain files
+    _hasSubagentsField: true, // cache bust: data.subagents added
+    _hasGhostSubagents: true, // cache bust: subagents now include ghost entries from purged transcripts
+    _subagentCostNumber: true, // cache bust: subagent.cost is now a number (was a money() string)
+    _subagentDescPairing: true, // cache bust: on-disk subagents without toolUseId now back-paired by description
+    _subagentContext: true,     // cache bust: per-subagent context usage added
   };
 }
 
@@ -1697,7 +1867,28 @@ function saveUiPrefs(prefs) {
 function diskCacheKey(filePath) {
   try {
     const st = statSync(filePath);
-    return `${filePath}|${st.size}|${st.mtimeMs}`;
+    // For Claude transcripts, also fold in the max mtime across all subagent jsonl
+    // files. The parent jsonl's mtime alone doesn't reflect activity in a running
+    // subagent (whose file is appended in-process by Claude Code without touching
+    // the parent), nor does the subagents/ dir mtime (which only changes when files
+    // are added or removed, not when existing ones are modified).
+    let subTag = "";
+    if (filePath.endsWith(".jsonl")) {
+      const subDir = filePath.replace(/\.jsonl$/, "") + "/subagents";
+      try {
+        const entries = listDir(subDir);
+        let maxSubMtime = statSync(subDir).mtimeMs;
+        for (const entry of entries) {
+          if (!entry.endsWith(".jsonl")) continue;
+          try {
+            const m = statSync(subDir + "/" + entry).mtimeMs;
+            if (m > maxSubMtime) maxSubMtime = m;
+          } catch { /* file vanished between readdir and stat */ }
+        }
+        subTag = `|${maxSubMtime}`;
+      } catch { /* no subagents dir */ }
+    }
+    return `${filePath}|${st.size}|${st.mtimeMs}${subTag}`;
   } catch {
     return null;
   }
@@ -1850,7 +2041,12 @@ async function safeExtractSessionData(session) {
   const hasCostsByDay = cache[dKey] && typeof cache[dKey].costsByHour === "object";
   const hasLocalDates = cache[dKey] && cache[dKey]._localDates === true;
   const hasNoSubagentModel = cache[dKey] && cache[dKey]._noSubagentModel === true;
-  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay && hasLocalDates && hasNoSubagentModel) {
+  const hasSubagentsField = cache[dKey] && cache[dKey]._hasSubagentsField === true;
+  const hasGhostSubagents = cache[dKey] && cache[dKey]._hasGhostSubagents === true;
+  const subagentCostNumber = cache[dKey] && cache[dKey]._subagentCostNumber === true;
+  const subagentDescPairing = cache[dKey] && cache[dKey]._subagentDescPairing === true;
+  const subagentContext = cache[dKey] && cache[dKey]._subagentContext === true;
+  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay && hasLocalDates && hasNoSubagentModel && hasSubagentsField && hasGhostSubagents && subagentCostNumber && subagentDescPairing && subagentContext) {
     SESSION_DATA_CACHE.set(memKey, cache[dKey]);
     SESSION_DATA_MTIME.set(memKey, effectiveMtime);
     return cache[dKey];
@@ -1923,6 +2119,13 @@ async function annotateListCosts(sessions, plan) {
         session.list_total_cost = "included";
       } else if (data) {
         session.list_total_cost = data.costs.total;
+      }
+      // Subagents (for list-row expansion)
+      if (data && Array.isArray(data.subagents)) {
+        session.list_subagents = data.subagents;
+        session.list_subagents_count = data.subagents.length;
+        session.list_subagents_cost = data.subagents.reduce(
+          (sum, sa) => sum + (typeof sa.cost === "number" ? sa.cost : Number(sa.cost) || 0), 0);
       }
     })
   );
@@ -2016,15 +2219,12 @@ function extractLastToolName(session) {
 function extractContextUsage(session) {
   if (!session || !session.data_file) return null;
   try {
-    let targetFile = session.data_file;
-    if (session.provider === "claude") {
-      const files = claudeTranscriptFiles(session.data_file);
-      let maxMt = 0;
-      for (const f of files) {
-        const mt = fileMtimeMs(f);
-        if (mt > maxMt) { maxMt = mt; targetFile = f; }
-      }
-    }
+    // Context usage is per-conversation; the parent session's CTX% must come
+    // from the parent's own jsonl. The previous logic picked whichever
+    // transcript file had the latest mtime, which meant CTX% would flip to
+    // a running subagent's context while it streamed — subagents run in their
+    // own isolated context and shouldn't shadow the parent's reading.
+    const targetFile = session.data_file;
 
     const lines = readFileTail(targetFile, 65536);
 
@@ -3485,6 +3685,15 @@ function createState() {
     _costDragStartRow: 0,
     _costDragStartScroll: 0,
     configScroll: 0, // scroll offset in Config panel content
+    subagentScroll: 0, // scroll offset in Subagents panel
+    // Per-surface sort: bottom Subagents panel and session-list expansion track
+    // independently so clicking one doesn't reshuffle the other.
+    subagentSortPanel: { col: "start", asc: false }, // bottom Subagents panel
+    subagentSortList:  { col: "start", asc: false }, // session-list expansion
+    _subagentColRanges: {},    // bottom panel header click ranges
+    _subagentExpColRanges: {}, // list expansion header click ranges
+    expandedSubagents: new Set(), // session keys ("provider:session_id") with subagents expanded in the list
+    flatList: [],     // virtual rows: [{type:"session"|"marker"|"subagent", session, subagent?, expanded?}]
     configSubTabHover: -1, // hover over config sub-tab
     _configPanelTop: 0, // 1-based row of first content row in config panel
     _configCopyTargets: [], // [{row, copyPath}]
@@ -3672,8 +3881,117 @@ function applySortAndFilter(state) {
   state.filtered = list;
   state.stats = computeStats(state.sessions);
 
-  // Clamp selection
-  if (state.selectedRow >= list.length) state.selectedRow = Math.max(0, list.length - 1);
+  // Rebuild the virtual (flat) list of rows that the UI iterates over: sessions
+  // plus expansion markers and subagent children when a session is expanded.
+  state.flatList = buildFlatList(state);
+
+  // Clamp selection against virtual-row count
+  if (state.selectedRow >= state.flatList.length) state.selectedRow = Math.max(0, state.flatList.length - 1);
+}
+
+/** Unique key for the expandedSubagents set; same shape used as session map keys. */
+function sessionKey(s) {
+  return `${s.provider}:${s.session_id}`;
+}
+
+/** Sortable subagent columns. Shared between the bottom Subagents panel and the
+ *  session-list expansion so a single state.subagentSort drives both surfaces.
+ *  `key` is what's stored in state, `extract` returns the comparable value. */
+const SUBAGENT_SORT_COLS = {
+  start: { extract: (sa) => sa.started_at || "" },
+  type:  { extract: (sa) => sa.type || "" },
+  model: { extract: (sa) => sa.model || "" },
+  desc:  { extract: (sa) => sa.description || "" },
+  cost:  { extract: (sa) => (typeof sa.cost === "number" ? sa.cost : Number(sa.cost) || 0) },
+  tools: { extract: (sa) => sa.tool_count || 0 },
+  ctx:   { extract: (sa) => sa.context ? (sa.context.used / (sa.context.max * COMPACT_THRESHOLD)) : -1 },
+  dur:   { extract: (sa) => sa.duration_ms || 0 },
+};
+
+/** Sort a list of subagents according to state.subagentSort, leaving the input untouched. */
+function sortSubagents(subs, sort) {
+  const col = (sort && sort.col) || "start";
+  const asc = !!(sort && sort.asc);
+  const def = SUBAGENT_SORT_COLS[col] || SUBAGENT_SORT_COLS.start;
+  const out = subs.slice();
+  out.sort((a, b) => {
+    const va = def.extract(a);
+    const vb = def.extract(b);
+    let cmp;
+    if (typeof va === "number" && typeof vb === "number") cmp = va - vb;
+    else cmp = String(va).localeCompare(String(vb));
+    return asc ? cmp : -cmp;
+  });
+  return out;
+}
+
+/** Build the virtual row list: each session, plus a marker + child rows when expanded. */
+function buildFlatList(state) {
+  const flat = [];
+  const expanded = state.expandedSubagents || new Set();
+  for (const s of state.filtered) {
+    flat.push({ type: "session", session: s });
+    const subs = Array.isArray(s.list_subagents) ? s.list_subagents : null;
+    if (subs && subs.length > 0) {
+      const isExpanded = expanded.has(sessionKey(s));
+      flat.push({ type: "marker", session: s, expanded: isExpanded, count: subs.length });
+      if (isExpanded) {
+        flat.push({ type: "subagent-header", session: s });
+        for (const sa of sortSubagents(subs, state.subagentSortList)) flat.push({ type: "subagent", session: s, subagent: sa });
+      }
+    }
+  }
+  return flat;
+}
+
+/** Return the session that "owns" the selected row (parent for marker/subagent). */
+function getSelectedSession(state) {
+  const row = state.flatList[state.selectedRow];
+  return row ? row.session : null;
+}
+
+/** Build a session-like object representing a subagent so the existing panel
+ *  renderers can consume it without modification. data_file points at the
+ *  subagent's own jsonl; ghost subagents (no on-disk transcript) get a null
+ *  data_file which yields the empty stub in safeExtractSessionData. */
+function subagentToSession(parent, sa) {
+  const subFile = (parent.data_file && !sa.ghost)
+    ? parent.data_file.replace(/\.jsonl$/, "") + "/subagents/" + sa.agent_id + ".jsonl"
+    : null;
+  return {
+    provider: parent.provider,
+    session_id: sa.agent_id,
+    data_file: subFile,
+    title: sa.description || null,
+    label_source: parent.label_source,
+    _abbrevLabel: parent._abbrevLabel,
+    started_at: sa.started_at,
+    last_active: sa.last_active || sa.started_at,
+    model: sa.model,
+    process: null,                  // subagents share the parent's PID
+    list_total_cost: sa.cost,
+    _isSubagent: true,
+    _parentSession: parent,
+    _subagent: sa,
+  };
+}
+
+/** Return the session whose data the bottom panels should display.
+ *  For subagent rows this is a synthesized subagent-as-session; otherwise the
+ *  same as getSelectedSession. */
+function getSelectedPanelSession(state) {
+  const row = state.flatList[state.selectedRow];
+  if (!row) return null;
+  if (row.type === "subagent") return subagentToSession(row.session, row.subagent);
+  return row.session;
+}
+
+/** Find the flat-list index of the session row that owns the given flat-list row index. */
+function findParentSessionIndex(state, flatIdx) {
+  for (let i = flatIdx; i >= 0; i--) {
+    if (state.flatList[i] && state.flatList[i].type === "session") return i;
+  }
+  return -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -4052,6 +4370,176 @@ function renderSessionRow(session, index, isSelected, width, now, hScroll, state
   return base + ansiSlice(line, hScroll, width) + RESET;
 }
 
+/** Dispatch one virtual row (session, marker, or subagent) to the appropriate renderer. */
+function renderFlatRow(row, index, isSelected, width, now, hScroll, state) {
+  if (!row) return "";
+  if (row.type === "session") {
+    return renderSessionRow(row.session, index, isSelected, width, now, hScroll, state);
+  }
+  if (row.type === "marker") {
+    return renderSubagentMarkerRow(row.session, row.expanded, row.count, isSelected, width, hScroll, state);
+  }
+  if (row.type === "subagent-header") {
+    return renderSubagentHeaderRow(isSelected, width, hScroll, state);
+  }
+  if (row.type === "subagent") {
+    return renderSubagentChildRow(row.subagent, isSelected, width, hScroll, state);
+  }
+  return "";
+}
+
+/** Indented "▶ N subagents ($X.XX)" marker shown beneath a session that has subagents. */
+function renderSubagentMarkerRow(session, expanded, count, isSelected, width, hScroll, state) {
+  const bg = isSelected ? C.selBg : "";
+  const fg = isSelected ? C.selFg : "";
+  const base = bg + fg;
+  const chev = expanded ? "▼" : "▶";
+  const subs = session.list_subagents || [];
+  const cost = typeof session.list_subagents_cost === "number"
+    ? "$" + session.list_subagents_cost.toFixed(2)
+    : null;
+  const ghosts = subs.filter(s => s.ghost).length;
+  const ghostNote = ghosts > 0 ? `  ${ghosts} purged` : "";
+  // Average duration is only worth showing once there are enough samples to
+  // be representative. Ghosts contribute no duration so they're excluded.
+  let avgNote = "";
+  if (count > 3) {
+    const durations = subs.filter(s => !s.ghost && typeof s.duration_ms === "number" && s.duration_ms > 0)
+      .map(s => s.duration_ms);
+    if (durations.length > 0) {
+      const avgMs = durations.reduce((a, b) => a + b, 0) / durations.length;
+      const s = Math.round(avgMs / 1000);
+      let avgStr;
+      if (s < 60)      avgStr = `${s}s`;
+      else if (s < 3600) {
+        const m = Math.floor(s / 60); const r = s % 60;
+        avgStr = `${m}m${String(r).padStart(2, "0")}s`;
+      } else {
+        const h = Math.floor(s / 3600); const mr = Math.floor((s % 3600) / 60);
+        avgStr = `${h}h${String(mr).padStart(2, "0")}m`;
+      }
+      avgNote = `  avg ${avgStr}`;
+    }
+  }
+  const label = `  └${chev} ${count} subagent${count === 1 ? "" : "s"}${cost ? `  (${cost})` : ""}${avgNote}${ghostNote}`;
+  const text = label.length > width - 2 ? label.slice(0, width - 3) + "…" : label;
+  const color = isSelected ? "" : C.dimText;
+  const line = base + color + text + RESET + base;
+  return base + ansiSlice(line, hScroll, width) + RESET;
+}
+
+/** Indented child row for a single subagent under an expanded session. */
+function renderSubagentChildRow(sa, isSelected, width, hScroll, state) {
+  const bg = isSelected ? C.selBg : "";
+  const fg = isSelected ? C.selFg : "";
+  const base = bg + fg;
+  const isGhost = sa.ghost === true;
+  const isRunning = sa.status === "running";
+  const icon = isGhost ? "◌" : (isRunning ? "●" : "○");
+  const iconColor = isSelected ? "" : (isGhost ? C.dimText : (isRunning ? C.chartBarHi : C.dimText));
+  const ts = sa.started_at ? new Date(sa.started_at) : null;
+  // 6-char column (matches the START header width): HH:MM left-aligned + trailing space.
+  const startStr = ((ts && !isNaN(ts.getTime()))
+    ? String(ts.getHours()).padStart(2, "0") + ":" + String(ts.getMinutes()).padStart(2, "0")
+    : "  —  ".slice(0, 5)).padEnd(6);
+  const cost = (isGhost || typeof sa.cost !== "number")
+    ? "      —"   // 7-char column, right-aligned em-dash to match $N.NN values
+    : ("$" + sa.cost.toFixed(2)).padStart(7);
+  // 6-char column (matches the TOOLS header): right-aligned numeric.
+  const tools = (isGhost ? "     —" : String(sa.tool_count || 0).padStart(6));
+  const dur = (isGhost || !sa.duration_ms)
+    ? "     —"
+    : (() => {
+        const s = Math.round(sa.duration_ms / 1000);
+        if (s < 60)    return `${s}s`.padStart(6);
+        const m = Math.floor(s / 60);
+        const r = s % 60;
+        if (m < 60)    return `${m}m${String(r).padStart(2, "0")}s`.padStart(6);
+        const h = Math.floor(m / 60);
+        const mr = m % 60;
+        return `${h}h${String(mr).padStart(2, "0")}m`.padStart(6);
+      })();
+  const desc = sa.description || "(no description)";
+  const model = (sa.model || "?").replace(/^claude-/, "").replace(/-\d{8}$/, "");
+  // Layout: "     ◌ 10:18  3m12s  $0.42   142  haiku-4-5     Implement Task 1"
+  const modelCell = (model.length > 12 ? model.slice(0, 11) + "…" : model).padEnd(12);
+  const prefix = `     ${icon} ${startStr}  ${dur}  ${cost}  ${tools}  ${modelCell}  `;
+  const maxDesc = Math.max(8, width - 2 - prefix.replace(/\x1b\[[^m]*m/g, "").length);
+  const descShort = desc.length > maxDesc ? desc.slice(0, maxDesc - 1) + "…" : desc;
+  const rowColor = isSelected ? "" : (isGhost ? C.dimText : "\x1b[38;5;250m");
+  // Match the parent session row's per-column color rules. When selected, keep
+  // the selection foreground (no override) so the highlight remains readable.
+  const costNum = typeof sa.cost === "number" ? sa.cost : Number(sa.cost) || 0;
+  const costCol  = isSelected || isGhost ? rowColor : costColor(costNum);
+  const modelCol = isSelected || isGhost ? rowColor : modelColor({ model: sa.model || "" });
+  // START column mirrors the parent's LAST column: ageDimColor on dispatch time.
+  const startCol = isSelected || isGhost
+    ? rowColor
+    : ageDimColor({ last_active: sa.started_at, process: isRunning }, new Date());
+  // DUR thresholds: ≤10m row color, >10m yellow, >30m red.
+  const durMs = sa.duration_ms || 0;
+  const durCol = isSelected || isGhost
+    ? rowColor
+    : durMs > 1800000 ? C.costRed
+    : durMs > 600000  ? C.costYellow
+    : rowColor;
+  const line = base + " ".repeat(5) + (iconColor || "") + icon + RESET + base +
+    " " + startCol + startStr + RESET + base +
+    "  " + durCol + dur + RESET + base +
+    "  " + costCol + cost + RESET + base +
+    rowColor + `  ${tools}  ` + RESET + base +
+    modelCol + modelCell + RESET + base +
+    rowColor + `  ${descShort}` + RESET + base;
+  return base + ansiSlice(line, hScroll, width) + RESET;
+}
+
+/** Column-label row shown right after the expansion marker so subagent rows
+ *  are self-describing. Aligns with renderSubagentChildRow's column widths.
+ *  Active sort column gets a ▲/▼; per-column click ranges are recorded for the
+ *  click handler to map clicks to sort keys. */
+function renderSubagentHeaderRow(isSelected, width, hScroll, state) {
+  const bg = isSelected ? C.selBg : "";
+  const fg = isSelected ? C.selFg : "";
+  const base = bg + fg;
+  const indent = "       "; // 5sp indent + 1ch icon-placeholder + 1sp gap
+  const sort = state.subagentSortList || { col: "start", asc: false };
+  const arrow = (k) => k === sort.col ? (sort.asc ? "▲" : "▼") : "";
+  // Each column width ≥ label.length + 1 so the active sort's ▲/▼ fits next to
+  // the label without ever cropping it. Data cells in renderSubagentChildRow
+  // pad to the same widths so columns stay aligned.
+  const segs = [
+    { key: "start", text: "START",       width: 6,  align: "left",  gap: 2 },
+    { key: "dur",   text: "DUR",         width: 6,  align: "right", gap: 2 },
+    { key: "cost",  text: "COST",        width: 7,  align: "right", gap: 2 },
+    { key: "tools", text: "TOOLS",       width: 6,  align: "right", gap: 2 },
+    { key: "model", text: "MODEL",       width: 12, align: "left",  gap: 2 },
+    { key: "desc",  text: "DESCRIPTION", width: 12, align: "left",  gap: 0 },
+  ];
+  const ranges = {};
+  let labelsStr = "";
+  let col = indent.length;
+  for (const s of segs) {
+    // Trim the label (not the arrow) when label+arrow would overflow the column.
+    const a = arrow(s.key);
+    const labelMax = Math.max(0, s.width - a.length);
+    const labelText = s.text.length > labelMax ? s.text.slice(0, labelMax) : s.text;
+    const cellRaw = labelText + a;
+    const cell = s.align === "right"
+      ? cellRaw.padStart(s.width)
+      : cellRaw.padEnd(s.width);
+    ranges[s.key] = [col, col + s.width - 1];
+    labelsStr += cell;
+    col += s.width;
+    if (s.gap > 0) { labelsStr += " ".repeat(s.gap); col += s.gap; }
+  }
+  state._subagentExpColRanges = ranges;
+  const headerStyle = isSelected ? "" : C.colHdrBg;
+  // No intermediate RESET so ansiSlice's trailing-space padding inherits the bg
+  // and the header bar extends across the full row.
+  const line = base + headerStyle + indent + labelsStr;
+  return base + ansiSlice(line, hScroll, width) + RESET;
+}
+
 // ---------------------------------------------------------------------------
 // Render: footer
 // ---------------------------------------------------------------------------
@@ -4249,33 +4737,81 @@ const MAX_PANEL = 30;
  * Build content lines for each of the three bottom panels, then merge
  * them side-by-side with box borders into composite screen lines.
  */
-const BOTTOM_TABS = ["Info", "Performance", "Processes", "Tool Activity", "Cost", "Config"];
+const BOTTOM_TABS = ["Info", "Performance", "Processes", "Tool Activity", "Cost", "Config", "Subagents"];
+// Tabs that are hidden unless the session has data for them. Map: tabIdx → predicate(data).
+const CONDITIONAL_TABS = {
+  6: (data) => !!(data && Array.isArray(data.subagents) && data.subagents.length > 0),
+};
+
+/** Return the indices of BOTTOM_TABS visible for this session's data, in display order. */
+function visibleBottomTabs(data) {
+  const out = [];
+  for (let i = 0; i < BOTTOM_TABS.length; i++) {
+    const cond = CONDITIONAL_TABS[i];
+    if (cond && !cond(data)) continue;
+    out.push(i);
+  }
+  return out;
+}
+
+/** Resolve state.bottomTab against visible tabs. Falls back to first visible if hidden. */
+function resolveActiveTab(state, data) {
+  const vis = visibleBottomTabs(data);
+  const wanted = state.bottomTab;
+  if (vis.includes(wanted)) return wanted;
+  return vis[0] || 0;
+}
+
+/** Select the Nth (0-based) tab in the static BOTTOM_TABS list, skipping if hidden for the current session. */
+function selectBottomTabByNumber(state, staticIdx) {
+  const cond = CONDITIONAL_TABS[staticIdx];
+  if (cond && !cond(state.panelData)) return; // tab not visible right now — ignore the keypress
+  state.bottomTab = staticIdx;
+  state.dirty = true;
+  saveUiPrefs({ bottomTab: state.bottomTab, listTab: state.listTab });
+}
+
+/** Cycle to the next visible bottom tab (delta = +1 or -1). */
+function cycleBottomTab(state, delta) {
+  const vis = visibleBottomTabs(state.panelData);
+  if (vis.length === 0) return;
+  const cur = vis.indexOf(resolveActiveTab(state, state.panelData));
+  const next = vis[((cur < 0 ? 0 : cur) + delta + vis.length) % vis.length];
+  state.bottomTab = next;
+  state.dirty = true;
+  saveUiPrefs({ bottomTab: state.bottomTab, listTab: state.listTab });
+}
 
 function renderBottomPanels(session, data, plan, width, panelHeight, activeTab, hoverTab, state) {
   const bc = C.border;
   const innerW = width - 4; // content inside │ ... │
   const innerH = panelHeight - 3; // top border + tab/rule line + bottom border
 
+  // Compute visible tabs for this session. Conditional tabs (e.g. Subagents) may be hidden.
+  const visIdxs = visibleBottomTabs(data);
+
   // Build tab positions first (shared between top border and rule line)
   // Layout: ╭─ Session  System  Tool Activity ──────────╮
   //         │  ───────━━━━━━━━──────────────────────────  │
   const tabParts = []; // [{col, len, idx}]
   let col = 3; // after "╭─ " or "│  "
-  for (let i = 0; i < BOTTOM_TABS.length; i++) {
+  for (let i = 0; i < visIdxs.length; i++) {
     if (i > 0) col += 2; // 2-space gap
-    tabParts.push({ col, len: BOTTOM_TABS[i].length, idx: i });
-    col += BOTTOM_TABS[i].length;
+    const ti = visIdxs[i];
+    tabParts.push({ col, len: BOTTOM_TABS[ti].length, idx: ti });
+    col += BOTTOM_TABS[ti].length;
   }
   const labelsEnd = col; // first char after last label
 
   // --- Top border with tab labels ---
   let topLine = bc + BOX.tl + BOX.h + " " + RESET;
-  for (let i = 0; i < BOTTOM_TABS.length; i++) {
+  for (let i = 0; i < visIdxs.length; i++) {
     if (i > 0) topLine += "  ";
-    const name = BOTTOM_TABS[i];
-    if (i === activeTab) {
+    const ti = visIdxs[i];
+    const name = BOTTOM_TABS[ti];
+    if (ti === activeTab) {
       topLine += C.panelTitle + name + RESET;
-    } else if (i === hoverTab) {
+    } else if (ti === hoverTab) {
       topLine += "\x1b[4;38;5;179m" + name + RESET; // underline amber on hover
     } else {
       topLine += "\x1b[38;5;245m" + name + RESET;
@@ -4288,12 +4824,13 @@ function renderBottomPanels(session, data, plan, width, panelHeight, activeTab, 
   // --- Underline rule: bright under active tab, dim elsewhere ---
   const dimRule = "\x1b[38;5;238m";
   let ruleLine = bc + BOX.v + RESET + dimRule + "──" + RESET;
-  for (let i = 0; i < BOTTOM_TABS.length; i++) {
+  for (let i = 0; i < visIdxs.length; i++) {
     if (i > 0) ruleLine += dimRule + "──" + RESET;
-    const name = BOTTOM_TABS[i];
-    if (i === activeTab) {
+    const ti = visIdxs[i];
+    const name = BOTTOM_TABS[ti];
+    if (ti === activeTab) {
       ruleLine += C.borderHi + "━".repeat(name.length) + RESET;
-    } else if (i === hoverTab) {
+    } else if (ti === hoverTab) {
       ruleLine += "\x1b[38;5;245m" + "━".repeat(name.length) + RESET; // subtle underline on hover
     } else {
       ruleLine += dimRule + "─".repeat(name.length) + RESET;
@@ -4312,6 +4849,7 @@ function renderBottomPanels(session, data, plan, width, panelHeight, activeTab, 
     case 3: contentLines = renderAgentPanel(session, data, width, innerH, state); break;
     case 4: contentLines = renderCostPanel(session, data, plan, width, innerH, state.costScroll, state); break;
     case 5: contentLines = renderConfigPanel(session, width, innerH, state); break;
+    case 6: contentLines = renderSubagentsPanel(session, data, width, innerH, state); break;
     default: contentLines = renderSessionInfoPanel(session, data, plan, width, innerH);
   }
 
@@ -4773,6 +5311,13 @@ function renderSystemPanel(session, data, panelW, rows) {
     return lines;
   }
 
+  if (session._isSubagent) {
+    lines.push(C.dimText + "Shared with parent process — no per-subagent OS metrics." + RESET);
+    lines.push(C.dimText + "Select the parent session row to see CPU/memory for the whole session." + RESET);
+    while (lines.length < rows) lines.push("");
+    return lines;
+  }
+
   const pm = session.process;
 
   if (!pm) {
@@ -4925,10 +5470,15 @@ function renderAgentPanel(session, data, panelW, rows, state) {
   let contentW = panelW - 4 - AGENT_TAB_WIDTH - 1; // inner width minus tab sidebar minus separator
   const HOME = process.env.HOME || "";
 
-  // Compute per-tool live counts (entries since agtop started)
+  // Compute per-tool live counts (entries since agtop started). The "live since
+  // agtop started" filter doesn't make sense for a subagent drill-down: subagents
+  // are point-in-time records, and applying the filter would silently zero out
+  // every count for any subagent whose timestamps predate agtop's launch (while
+  // the same subagent's row in the list keeps showing its raw tool count).
+  const liveFilterActive = state.agentLiveFilter && !session._isSubagent;
   const startTime = state._startTime || "";
   const liveCountByTool = {};
-  if (state.agentLiveFilter && m.tool_details) {
+  if (liveFilterActive && m.tool_details) {
     let allLive = 0;
     for (const [tName] of toolList) {
       if (tName === "*All") continue;
@@ -4966,7 +5516,7 @@ function renderAgentPanel(session, data, panelW, rows, state) {
   });
 
   // Apply live filter if active
-  const sorted = state.agentLiveFilter
+  const sorted = liveFilterActive
     ? allSorted.filter(e => {
         const ts = typeof e === "string" ? "" : (e.ts || "");
         return ts >= startTime;
@@ -5042,7 +5592,7 @@ function renderAgentPanel(session, data, panelW, rows, state) {
       state._agentDownArrowRow = r;
     } else if (tabIdx < toolList.length) {
       const [tName, tCount] = toolList[tabIdx];
-      const displayCount = state.agentLiveFilter ? (liveCountByTool[tName] || 0) : tCount;
+      const displayCount = liveFilterActive ? (liveCountByTool[tName] || 0) : tCount;
       const isActive = tabIdx === state.agentToolTab;
       const isHover = tabIdx === state.hoverAgentToolTab;
       const flashTs = state._agentToolFlash[tName] || 0;
@@ -5088,6 +5638,14 @@ function renderAgentPanel(session, data, panelW, rows, state) {
 
     // --- Header row (first content row) ---
     if (r === 0) {
+      // Hide the Live toggle for subagent drill-downs — the filter doesn't apply
+      // there (see liveFilterActive computation above), so showing the button
+      // would suggest a toggle that has no effect.
+      if (session._isSubagent) {
+        state._agentLiveBtn = null;
+        lines.push(line);
+        continue;
+      }
       const liveOn = state.agentLiveFilter;
       const btnInner = liveOn ? "● Live" : "○ Live";
       const btnInnerLen = btnInner.length;
@@ -5179,6 +5737,201 @@ function renderAgentPanel(session, data, panelW, rows, state) {
     if (vLen < maxW) return l + " ".repeat(maxW - vLen);
     return l;
   });
+}
+
+// ---------------------------------------------------------------------------
+// Render: subagents panel
+// ---------------------------------------------------------------------------
+
+/** Render the Subagents panel: one row per subagent the session has spawned.
+ *  Read-only listing. Sorted with running entries first, then newest started_at first. */
+function renderSubagentsPanel(session, data, panelW, rows, state) {
+  const lines = [];
+  const w = panelW - 4;
+
+  if (!session) {
+    lines.push(C.dimText + "No session selected" + RESET);
+    while (lines.length < rows) lines.push("");
+    return lines;
+  }
+  if (!data) {
+    lines.push(C.dimText + "Loading..." + RESET);
+    while (lines.length < rows) lines.push("");
+    return lines;
+  }
+
+  const list = (data.subagents || []).slice();
+  if (list.length === 0) {
+    lines.push(C.dimText + "No subagents" + RESET);
+    while (lines.length < rows) lines.push("");
+    return lines;
+  }
+
+  // Running first; within each status group, newest started_at first.
+  const sortedList = sortSubagents(list, state.subagentSortPanel);
+
+  // Column widths (status icon is 1 col wide; we add a trailing space after each column).
+  // Widths are sized so the active sort's ▲/▼ arrow always fits next to the label
+  // without truncating it: each width ≥ labelLen + 1.
+  const startW = 6;  // "HH:MM" + 1 spare for the arrow
+  const typeW = 12;
+  const modelW = 12;
+  const costW = 7;   // up to "$999.99"
+  const toolsW = 6;  // up to 99999 + 1 spare for the arrow
+  const ctxW = 4;    // "100%"
+  const timeW = 7;   // "MM:SS", "Xm SSs", "Xh YYm"
+  const fixedW = startW + 1 + 1 + 1 + typeW + 1 + modelW + 1 + 1 + costW + 1 + toolsW + 1 + ctxW + 1 + timeW;
+  const descW = Math.max(10, w - fixedW);
+
+  const fmtStart = (ts) => {
+    if (!ts) return "—".padStart(startW);
+    const d = new Date(ts);
+    if (isNaN(d.getTime())) return "?".padStart(startW);
+    const t = String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+    return t.padEnd(startW);
+  };
+
+  const shortModel = (m) => (m || "?")
+    .replace(/^claude-/, "")
+    .replace(/-\d{8}$/, "")
+    .replace(/^gpt-/, "");
+
+  const fmtDur = (ms) => {
+    if (!ms || ms <= 0) return "—";
+    const s = Math.round(ms / 1000);
+    if (s < 60)    return `${s}s`;
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    if (m < 60)    return `${m}m${String(r).padStart(2, "0")}s`;
+    const h = Math.floor(m / 60);
+    const mr = m % 60;
+    return `${h}h${String(mr).padStart(2, "0")}m`;
+  };
+
+  const truncate = (s, n) => {
+    s = String(s ?? "");
+    if (s.length <= n) return s;
+    return s.slice(0, Math.max(1, n - 1)) + "…";
+  };
+
+  // Header row — uses the same bold-white-on-dark-gray style as the session list
+  // column header (C.colHdrBg). No trailing RESET so boxLine's ansiSlice pads the
+  // remainder of the row with bg-bearing spaces, extending the bar to full width.
+  // Active sort column gets a ▲/▼ arrow. Per-column click ranges are recorded so
+  // the click handler can map a mouse col → sort key.
+  const hdr = C.colHdrBg;
+  const sort = state.subagentSortPanel || { col: "start", asc: false };
+  const arrow = (k) => k === sort.col ? (sort.asc ? "▲" : "▼") : "";
+  const ranges = {};
+  // Each segment: { key, text, width, align ("left"|"right"), gap (chars after) }
+  const segs = [
+    { key: "start", text: "START", width: startW, align: "left",  gap: 3 },
+    { key: "type",  text: "TYPE",  width: typeW,  align: "left",  gap: 1 },
+    { key: "model", text: "MODEL", width: modelW, align: "left",  gap: 1 },
+    { key: "desc",  text: "DESC",  width: descW,  align: "left",  gap: 1 },
+    { key: "cost",  text: "COST",  width: costW,  align: "right", gap: 1 },
+    { key: "tools", text: "TOOLS", width: toolsW, align: "right", gap: 1 },
+    { key: "ctx",   text: "CTX",   width: ctxW,   align: "right", gap: 1 },
+    { key: "dur",   text: "TIME",  width: timeW,  align: "right", gap: 0 },
+  ];
+  let headerLine = hdr;
+  let col = 0;
+  for (const s of segs) {
+    // Trim the LABEL (not the arrow) when label+arrow would overflow the column.
+    // Slicing the combined string from the left ate the arrow on columns where
+    // the label was exactly column-width long (START, TOOLS), so the sort arrow
+    // flickered: visible for some columns, missing for others.
+    const a = arrow(s.key);
+    const labelMax = Math.max(0, s.width - a.length);
+    const labelText = s.text.length > labelMax ? s.text.slice(0, labelMax) : s.text;
+    const cellRaw = labelText + a;
+    const cell = s.align === "right"
+      ? cellRaw.padStart(s.width)
+      : cellRaw.padEnd(s.width);
+    ranges[s.key] = [col, col + s.width - 1]; // inclusive char range within the panel inner area
+    headerLine += cell;
+    col += s.width;
+    if (s.gap > 0) { headerLine += " ".repeat(s.gap); col += s.gap; }
+  }
+  state._subagentColRanges = ranges;
+  lines.push(headerLine);
+
+  // Scroll handling (auto-clamp; default top)
+  if (state.subagentScroll === undefined) state.subagentScroll = 0;
+  if (state.subagentScroll < 0) state.subagentScroll = 0;
+  const visibleRows = Math.max(0, rows - 1);
+  const maxScroll = Math.max(0, sortedList.length - visibleRows);
+  if (state.subagentScroll > maxScroll) state.subagentScroll = maxScroll;
+
+  for (let i = 0; i < visibleRows; i++) {
+    const sa = sortedList[i + state.subagentScroll];
+    if (!sa) { lines.push(""); continue; }
+    const isRunning = sa.status === "running";
+    const isGhost = sa.ghost === true;
+
+    // Status icon: bright ● running / plain ○ done; ghost rows use a dotted ◌ to flag
+    // that the on-disk transcript is gone and per-agent metrics aren't available.
+    let statusIcon;
+    if (isGhost) {
+      statusIcon = C.dimText + "◌" + RESET;
+    } else if (isRunning) {
+      statusIcon = C.chartBarHi + "●" + RESET;
+    } else {
+      statusIcon = C.dimText + "○" + RESET;
+    }
+
+    const typeStr = truncate(sa.type || "?", typeW).padEnd(typeW);
+    const modelStr = truncate(shortModel(sa.model), modelW).padEnd(modelW);
+    const descStr = truncate(sa.description || "(no description)", descW).padEnd(descW);
+    const costNum = typeof sa.cost === "number" ? sa.cost : Number(sa.cost) || 0;
+    // Ghost rows: we don't know cost/tools/duration — show em-dash placeholders.
+    const costStr  = (isGhost ? "—"  : ("$" + costNum.toFixed(2))).padStart(costW);
+    const toolsStr = (isGhost ? "—"  : String(sa.tool_count || 0)).padStart(toolsW);
+    // CTX% against the model's compact threshold (same formula as the parent CTX column).
+    const ctx = sa.context;
+    const ctxPct = ctx ? (ctx.used / (ctx.max * COMPACT_THRESHOLD)) * 100 : 0;
+    const ctxStr = (isGhost || !ctx)
+      ? "—".padStart(ctxW)
+      : (Math.round(ctxPct) + "%").padStart(ctxW);
+    const timeStr  = (isGhost ? "—"  : fmtDur(sa.duration_ms)).padStart(timeW);
+
+    // Ghost rows are dimmed overall; live rows use brighter row color when running.
+    const rowColor = isGhost ? C.dimText : (isRunning ? C.hdrValue : "\x1b[38;5;250m");
+    // Match the parent session row's per-column color rules where they apply.
+    const costColForCol = isGhost ? rowColor : costColor(costNum);
+    const ctxColForCol = isGhost || !ctx ? C.dimText
+      : ctxPct > 85 ? C.costRed
+      : ctxPct > 65 ? C.costYellow
+      : ctxPct > 0  ? C.chartBarLow
+      : C.dimText;
+    const modelColForCol = isGhost ? rowColor : modelColor({ model: sa.model || "" });
+    // START column mirrors the parent's LAST column: ageDimColor on dispatch time.
+    const startColForCol = isGhost
+      ? C.dimText
+      : ageDimColor({ last_active: sa.started_at, process: isRunning }, new Date());
+    // DUR/TIME thresholds: ≤10m row color, >10m yellow, >30m red.
+    const durMs = sa.duration_ms || 0;
+    const timeColForCol = isGhost
+      ? rowColor
+      : durMs > 1800000 ? C.costRed
+      : durMs > 600000  ? C.costYellow
+      : rowColor;
+    const startStr = fmtStart(sa.started_at);
+    lines.push(
+      startColForCol + startStr + RESET + " " +
+      statusIcon + " " +
+      rowColor + typeStr + RESET + " " +
+      modelColForCol + modelStr + RESET + " " +
+      rowColor + descStr + RESET + " " +
+      costColForCol + costStr + RESET + " " +
+      rowColor + toolsStr + RESET + " " +
+      ctxColForCol + ctxStr + RESET + " " +
+      timeColForCol + timeStr + RESET
+    );
+  }
+
+  while (lines.length < rows) lines.push("");
+  return lines;
 }
 
 // ---------------------------------------------------------------------------
@@ -5433,6 +6186,13 @@ function renderDeleteConfirm(session, width) {
 function renderProcessesPanel(session, panelW, rows, state) {
   const lines = [];
   const inner = panelW - 4;
+
+  if (session && session._isSubagent) {
+    lines.push(C.dimText + "Shared with parent process — no per-subagent OS process list." + RESET);
+    lines.push(C.dimText + "Select the parent session row to see its process tree." + RESET);
+    while (lines.length < rows) lines.push("");
+    return lines;
+  }
 
   if (!session || !session.process) {
     lines.push(C.dimText + "Performance data is only available for running sessions" + RESET);
@@ -5784,7 +6544,10 @@ function render(state) {
   // List area = boxTop(1) + colHeader(1) + rows + boxBottom(1)
   const listHeight = Math.max(1, listAreaH - 3);
   const now = new Date();
-  const list = state.filtered;
+  // Recompute the virtual row list (sessions + markers + expanded children) every render
+  // so changes to filtered/sorted sessions or expansion state are picked up.
+  state.flatList = buildFlatList(state);
+  const flat = state.flatList;
 
   // Adjust scroll to keep selection visible
   if (state.selectedRow < state.scrollOffset) {
@@ -5800,7 +6563,7 @@ function render(state) {
   state._colHeaderRow = screenLines.length + 1; // 1-based row of column header
   screenLines.push(renderColumnHeaders(state, boxW));
 
-  if (list.length === 0 && state.listTab === 1) {
+  if (state.filtered.length === 0 && state.listTab === 1) {
     // Empty Live tab
     const emptyMsg = C.dimText + "  No active sessions running" + RESET;
     screenLines.push(emptyMsg);
@@ -5808,9 +6571,9 @@ function render(state) {
   } else {
     for (let i = 0; i < listHeight; i++) {
       const idx = state.scrollOffset + i;
-      if (idx < list.length) {
+      if (idx < flat.length) {
         const isSelected = idx === state.selectedRow;
-        screenLines.push(renderSessionRow(list[idx], idx, isSelected, boxW, now, state.hScroll, state));
+        screenLines.push(renderFlatRow(flat[idx], idx, isSelected, boxW, now, state.hScroll, state));
       } else {
         screenLines.push("");
       }
@@ -5818,12 +6581,13 @@ function render(state) {
   }
   screenLines.push(boxBottom(boxW));
 
-  // Bottom detail panels (tabbed)
-  const selected = list[state.selectedRow] || null;
+  // Bottom detail panels (tabbed) — for subagent rows we synthesize a session-like
+  // object so the existing panel renderers can consume the subagent's own data.
+  const selected = getSelectedPanelSession(state);
   const panelPlan = selected ? (selected.provider === "codex" ? state.codexPlan : state.claudePlan) : null;
   state._tabBarRow = screenLines.length + 1; // 1-based row of the tab bar
   state._configPanelTop = screenLines.length + 3; // 1-based: tab bar + rule line → first content row
-  const bottomLines = renderBottomPanels(selected, state.panelData, panelPlan, boxW, panelHeight, state.bottomTab, state.hoverTab, state);
+  const bottomLines = renderBottomPanels(selected, state.panelData, panelPlan, boxW, panelHeight, resolveActiveTab(state, state.panelData), state.hoverTab, state);
   for (const pl of bottomLines) screenLines.push(pl);
 
   // Limits panel (below bottom panels)
@@ -5883,7 +6647,7 @@ function render(state) {
 
   // Overlay delete confirmation
   if (state.mode === "delete") {
-    const sel = state.filtered[state.selectedRow];
+    const sel = getSelectedSession(state);
     if (sel) {
       const dm = renderDeleteConfirm(sel, width);
       const startRow = Math.max(0, Math.floor((screenLines.length - dm.lines.length) / 2));
@@ -5906,7 +6670,7 @@ function render(state) {
 
   // Overlay delete-blocked modal (live session)
   if (state.mode === "delete_live") {
-    const sel = state.filtered[state.selectedRow];
+    const sel = getSelectedSession(state);
     if (sel) {
       const dm = renderDeleteLiveBlocked(sel, width);
       const startRow = Math.max(0, Math.floor((screenLines.length - dm.lines.length) / 2));
@@ -6173,13 +6937,17 @@ function columnScreenPos(colKey, hScroll, state) {
   return null;
 }
 
-/** Given a 1-based column, return which tab index (0-2) was clicked, or -1. */
-function tabAtX(col) {
+/** Given a 1-based column and the panel data (for visible-tab filtering), return the
+ *  static BOTTOM_TABS index that was clicked, or -1. Hidden conditional tabs are skipped
+ *  so click coordinates line up with what's actually drawn. */
+function tabAtX(col, data) {
+  const vis = visibleBottomTabs(data);
   let pos = 4; // skip ╭─ + space (1-based)
-  for (let i = 0; i < BOTTOM_TABS.length; i++) {
+  for (let i = 0; i < vis.length; i++) {
     if (i > 0) pos += 2; // 2-space gap between tabs
-    const w = BOTTOM_TABS[i].length;
-    if (col >= pos && col < pos + w) return i;
+    const staticIdx = vis[i];
+    const w = BOTTOM_TABS[staticIdx].length;
+    if (col >= pos && col < pos + w) return staticIdx;
     pos += w;
   }
   return -1;
@@ -6324,7 +7092,7 @@ function handleEvent(event, state) {
       state.mode = "list"; state.dirty = true; return;
     }
     if (event.type === "char" && event.char === "y") {
-      const sel = state.filtered[state.selectedRow];
+      const sel = getSelectedSession(state);
       if (sel) {
         deleteSession(sel);
         // Remove from sessions list and refilter
@@ -6346,7 +7114,7 @@ function handleEvent(event, state) {
   }
 
   // --- List mode ---
-  const listLen = state.filtered.length;
+  const listLen = (state.flatList && state.flatList.length) || state.filtered.length;
   const bodyHeight = Math.max(1, (process.stdout.rows || 24) - (state.headerLines + 2));
 
   switch (event.type) {
@@ -6367,7 +7135,7 @@ function handleEvent(event, state) {
         case "<": openSortBy(state); return;
         case "r": state._needsRefresh = true; return;
         case "d": {
-          const sel = state.filtered[state.selectedRow];
+          const sel = getSelectedSession(state);
           if (sel && sel.process) { state.mode = "delete_live"; state.dirty = true; }
           else if (sel) { state.mode = "delete"; state.dirty = true; }
           return;
@@ -6375,12 +7143,13 @@ function handleEvent(event, state) {
         case "P": setSortColumn(state, "status"); return;
         case "M": setSortColumn(state, "mem"); return;
         case "T": setSortColumn(state, "cost"); return;
-        case "1": state.bottomTab = 0; state.dirty = true; saveUiPrefs({ bottomTab: 0, listTab: state.listTab }); return;
-        case "2": state.bottomTab = 1; state.dirty = true; saveUiPrefs({ bottomTab: 1, listTab: state.listTab }); return;
-        case "3": state.bottomTab = 2; state.dirty = true; saveUiPrefs({ bottomTab: 2, listTab: state.listTab }); return;
-        case "4": state.bottomTab = 3; state.dirty = true; saveUiPrefs({ bottomTab: 3, listTab: state.listTab }); return;
-        case "5": state.bottomTab = 4; state.dirty = true; saveUiPrefs({ bottomTab: 4, listTab: state.listTab }); return;
-        case "6": state.bottomTab = 5; state.dirty = true; saveUiPrefs({ bottomTab: 5, listTab: state.listTab }); return;
+        case "1": selectBottomTabByNumber(state, 0); return;
+        case "2": selectBottomTabByNumber(state, 1); return;
+        case "3": selectBottomTabByNumber(state, 2); return;
+        case "4": selectBottomTabByNumber(state, 3); return;
+        case "5": selectBottomTabByNumber(state, 4); return;
+        case "6": selectBottomTabByNumber(state, 5); return;
+        case "7": selectBottomTabByNumber(state, 6); return;
         case "`": switchListTab(state); return;
         default: return;
       }
@@ -6390,9 +7159,7 @@ function handleEvent(event, state) {
       switchListTab(state);
       return;
     case "tab":
-      state.bottomTab = (state.bottomTab + 1) % BOTTOM_TABS.length;
-      state.dirty = true;
-      saveUiPrefs({ bottomTab: state.bottomTab, listTab: state.listTab });
+      cycleBottomTab(state, 1);
       return;
     case "f1": state.mode = "help"; state.dirty = true; return;
     case "f3": state.mode = "search"; state.dirty = true; return;
@@ -6404,6 +7171,57 @@ function handleEvent(event, state) {
       state._inactivityCursor = idx >= 0 ? idx : INACTIVITY_OPTIONS.length - 1;
       state.mode = "inactivity"; state.dirty = true; return;
     }
+  }
+
+  // Subagent expansion (Right expands on session/marker, Left collapses)
+  const flatRow = state.flatList && state.flatList[state.selectedRow];
+  if (event.type === "right" && flatRow) {
+    if ((flatRow.type === "session" || flatRow.type === "marker")) {
+      const s = flatRow.session;
+      const hasSubs = Array.isArray(s.list_subagents) && s.list_subagents.length > 0;
+      if (hasSubs && !state.expandedSubagents.has(sessionKey(s))) {
+        state.expandedSubagents.add(sessionKey(s));
+        state.flatList = buildFlatList(state);
+        state.dirty = true;
+        return;
+      }
+    }
+  }
+  if (event.type === "left" && flatRow) {
+    if (flatRow.type === "subagent" || flatRow.type === "subagent-header" || flatRow.type === "marker" || flatRow.type === "session") {
+      const s = flatRow.session;
+      if (state.expandedSubagents.has(sessionKey(s))) {
+        state.expandedSubagents.delete(sessionKey(s));
+        state.flatList = buildFlatList(state);
+        // Pick the post-collapse selection target:
+        // - session row → stay on the session row
+        // - marker row (the fold/unfold affordance, still present after collapse) → stay on it
+        // - sub-header / subagent rows (removed by collapse) → land on the marker so
+        //   the user can press Right again to re-expand from the same place
+        let target = -1;
+        if (flatRow.type === "session") {
+          target = state.flatList.findIndex(r => r.type === "session" && r.session === s);
+        } else {
+          target = state.flatList.findIndex(r => r.type === "marker" && r.session === s);
+          if (target < 0) target = state.flatList.findIndex(r => r.type === "session" && r.session === s);
+        }
+        if (target >= 0) state.selectedRow = target;
+        state.dirty = true;
+        return;
+      }
+    }
+  }
+  // Enter on a marker or sub-header toggles the expansion of its parent
+  if (event.type === "enter" && flatRow && (flatRow.type === "marker" || flatRow.type === "subagent-header")) {
+    const s = flatRow.session;
+    if (state.expandedSubagents.has(sessionKey(s))) {
+      state.expandedSubagents.delete(sessionKey(s));
+    } else {
+      state.expandedSubagents.add(sessionKey(s));
+    }
+    state.flatList = buildFlatList(state);
+    state.dirty = true;
+    return;
   }
 
   // Navigation
@@ -6465,6 +7283,8 @@ function handleEvent(event, state) {
         } else {
           if (state.agentToolScroll > 0) { state.agentToolScroll--; state.dirty = true; }
         }
+      } else if (state.bottomTab === 6 && state._configPanelTop && event.row >= state._configPanelTop) {
+        if ((state.subagentScroll || 0) > 0) { state.subagentScroll = (state.subagentScroll || 0) - 1; state.dirty = true; }
       } else {
         if (state.selectedRow > 0) { state.selectedRow--; state.dirty = true; }
       }
@@ -6485,6 +7305,8 @@ function handleEvent(event, state) {
         } else {
           state.agentToolScroll++; state.dirty = true; // clamped in render
         }
+      } else if (state.bottomTab === 6 && state._configPanelTop && event.row >= state._configPanelTop) {
+        state.subagentScroll = (state.subagentScroll || 0) + 1; state.dirty = true; // clamped in render
       } else {
         if (state.selectedRow < listLen - 1) { state.selectedRow++; state.dirty = true; }
       }
@@ -6520,9 +7342,9 @@ function handleEvent(event, state) {
               case "f3": state.mode = "search"; state.dirty = true; break;
               case "f5": state._needsRefresh = true; break;
               case "f6": openSortBy(state); break;
-              case "tab": state.bottomTab = (state.bottomTab + 1) % BOTTOM_TABS.length; state.dirty = true; saveUiPrefs({ bottomTab: state.bottomTab, listTab: state.listTab }); break;
+              case "tab": cycleBottomTab(state, 1); break;
               case "backtick": switchListTab(state); break;
-              case "d_delete": { const sel = state.filtered[state.selectedRow]; if (sel && !sel.process) { state.mode = "delete"; state.dirty = true; } break; }
+              case "d_delete": { const sel = getSelectedSession(state); if (sel && !sel.process) { state.mode = "delete"; state.dirty = true; } break; }
               case "f7": { const idx = INACTIVITY_OPTIONS.findIndex(o => o.key === state.inactivityFilter); state._inactivityCursor = idx >= 0 ? idx : INACTIVITY_OPTIONS.length - 1; state.mode = "inactivity"; state.dirty = true; break; }
               case "f10": state.quit = true; break;
             }
@@ -6541,7 +7363,7 @@ function handleEvent(event, state) {
       }
       // Check if click is on the bottom tab bar (top border row or underline row)
       if (state._tabBarRow && (event.row === state._tabBarRow || event.row === state._tabBarRow + 1)) {
-        const tabIdx = tabAtX(event.col);
+        const tabIdx = tabAtX(event.col, state.panelData);
         if (tabIdx >= 0) {
           state.bottomTab = tabIdx;
           state.dirty = true;
@@ -6551,7 +7373,7 @@ function handleEvent(event, state) {
       }
       // Check if click is on a copy icon (⧉) in the Info panel
       if (state.bottomTab === 0 && state._tabBarRow) {
-        const selected = state.filtered[state.selectedRow];
+        const selected = getSelectedSession(state);
         if (selected && selected._copyTargets) {
           for (const target of selected._copyTargets) {
             const screenRow = state._tabBarRow + 2 + target.line; // +2 for tab bar + rule
@@ -6675,6 +7497,22 @@ function handleEvent(event, state) {
           return;
         }
       }
+      // Check if click is in Subagents panel header (sort) — bottomTab 6
+      if (state.bottomTab === 6 && state._configPanelTop && event.row === state._configPanelTop) {
+        const innerCol = event.col - 3; // border "│ " + 1-based → 0-based inner column
+        const ranges = state._subagentColRanges || {};
+        for (const k of Object.keys(ranges)) {
+          const [a, b] = ranges[k];
+          if (innerCol >= a && innerCol <= b) {
+            const cur = state.subagentSortPanel || { col: "start", asc: false };
+            if (cur.col === k) state.subagentSortPanel = { col: k, asc: !cur.asc };
+            else state.subagentSortPanel = { col: k, asc: k === "start" ? false : true };
+            saveUiPrefs({ subagentSortPanel: state.subagentSortPanel });
+            state.dirty = true;
+            return;
+          }
+        }
+      }
       // Check if click is in Cost panel scrollbar
       if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
@@ -6698,7 +7536,7 @@ function handleEvent(event, state) {
       // Check if click is in Config panel area
       if (state.bottomTab === 5 && state._configPanelTop && event.row >= state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
-        const selected = state.filtered[state.selectedRow];
+        const selected = getSelectedSession(state);
         const sections = getSessionConfig(selected);
         const sb = state._configScrollbar;
         // Click on scrollbar
@@ -6751,11 +7589,38 @@ function handleEvent(event, state) {
         const colKey = columnAtX(event.col, state.hScroll, state);
         if (colKey) setSortColumn(state, colKey);
       } else if (state._colHeaderRow && event.row > state._colHeaderRow) {
-        // Click on session row
+        // Click on a virtual row (session, marker, or subagent)
         const rowIdx = state.scrollOffset + (event.row - state._colHeaderRow - 1);
         if (rowIdx >= 0 && rowIdx < listLen) {
           state.selectedRow = rowIdx;
           state.dirty = true;
+          const r = state.flatList[rowIdx];
+          // Sub-header row: a click on a column label sets the sort; clicks
+          // anywhere else on the row leave selection only (the marker above is
+          // the primary affordance to collapse).
+          if (r && r.type === "subagent-header") {
+            const innerCol = event.col - 2; // 1-based column → 0-based (the list area starts at col 2)
+            const ranges = state._subagentExpColRanges || {};
+            for (const k of Object.keys(ranges)) {
+              const [a, b] = ranges[k];
+              if (innerCol >= a && innerCol <= b) {
+                const cur = state.subagentSortList || { col: "start", asc: false };
+                if (cur.col === k) state.subagentSortList = { col: k, asc: !cur.asc };
+                else state.subagentSortList = { col: k, asc: k === "start" ? false : true };
+                saveUiPrefs({ subagentSortList: state.subagentSortList });
+                state.flatList = buildFlatList(state);
+                return;
+              }
+            }
+            return;
+          }
+          // Clicking the marker toggles expansion immediately on the first click.
+          if (r && r.type === "marker") {
+            const s = r.session;
+            if (state.expandedSubagents.has(sessionKey(s))) state.expandedSubagents.delete(sessionKey(s));
+            else state.expandedSubagents.add(sessionKey(s));
+            state.flatList = buildFlatList(state);
+          }
         }
       }
       return;
@@ -6765,7 +7630,7 @@ function handleEvent(event, state) {
       // Track hover over bottom tab bar
       let newHover = -1;
       if (state._tabBarRow && (event.row === state._tabBarRow || event.row === state._tabBarRow + 1)) {
-        const idx = tabAtX(event.col);
+        const idx = tabAtX(event.col, state.panelData);
         if (idx >= 0) newHover = idx;
       }
       // Track hover over Live button in list tab bar
@@ -6802,7 +7667,7 @@ function handleEvent(event, state) {
       }
       if (state.bottomTab === 5 && state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
-        const selected = state.filtered[state.selectedRow];
+        const selected = getSelectedSession(state);
         const sections = getSessionConfig(selected);
         if (rowInPanel >= 0 && event.col <= CONFIG_TAB_WIDTH + 2 && rowInPanel < sections.length) {
           newConfigHover = rowInPanel;
@@ -7246,6 +8111,9 @@ async function main() {
           if (data && data.rates) {
             obj.rates = data.rates;
           }
+          if (data && Array.isArray(data.subagents)) {
+            obj.subagents = data.subagents;
+          }
           return obj;
         }));
         console.log(JSON.stringify(jsonSessions, null, 2));
@@ -7277,6 +8145,14 @@ async function main() {
   if (typeof _savedPrefs.bottomTab === "number") state.bottomTab = _savedPrefs.bottomTab;
   if (typeof _savedPrefs.listTab === "number") state.listTab = _savedPrefs.listTab;
   if (typeof _savedPrefs.agentLiveFilter === "boolean") state.agentLiveFilter = _savedPrefs.agentLiveFilter;
+  const restoreSort = (saved) =>
+    saved && typeof saved === "object" && typeof saved.col === "string" && SUBAGENT_SORT_COLS[saved.col]
+      ? { col: saved.col, asc: !!saved.asc }
+      : null;
+  const sp = restoreSort(_savedPrefs.subagentSortPanel);
+  if (sp) state.subagentSortPanel = sp;
+  const sl = restoreSort(_savedPrefs.subagentSortList);
+  if (sl) state.subagentSortList = sl;
   if (_savedPrefs.inactivityFilter !== undefined) {
     state.inactivityFilter = _savedPrefs.inactivityFilter || null;
     const idx = INACTIVITY_OPTIONS.findIndex(o => o.key === state.inactivityFilter);
@@ -7322,8 +8198,8 @@ async function main() {
     return 1;
   }
 
-  // Load panel data for the initially selected session
-  const initSel = state.filtered[state.selectedRow];
+  // Load panel data for the initially selected row (subagent-aware)
+  const initSel = getSelectedPanelSession(state);
   if (initSel) {
     state._panelSessionId = initSel.session_id;
     state.panelData = await safeExtractSessionData(initSel);
@@ -7336,9 +8212,9 @@ async function main() {
   const delayMs = args.delay * 1000;
   const doRefresh = async () => {
     await loadSessions(state);
-    // Re-load panel data for current selection
+    // Re-load panel data for current selection (subagent-aware)
     state._panelSessionId = null;
-    const panelSel = state.filtered[state.selectedRow];
+    const panelSel = getSelectedPanelSession(state);
     if (panelSel) {
       state._panelSessionId = panelSel.session_id;
       state.panelData = await safeExtractSessionData(panelSel);
@@ -7390,8 +8266,8 @@ async function main() {
       state.dirty = true;
     }
 
-    // Load panel data when selection changes
-    const panelSel = state.filtered[state.selectedRow];
+    // Load panel data when selection changes (subagent-aware)
+    const panelSel = getSelectedPanelSession(state);
     if (panelSel && panelSel.session_id !== state._panelSessionId) {
       state._panelSessionId = panelSel.session_id;
       state.panelData = null; // show "Loading..." immediately

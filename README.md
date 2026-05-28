@@ -23,6 +23,7 @@ Your window into what your AI coding agents are doing, sitting in the terminal, 
 - **Tool Activity panel** -- scrollable per-tool invocation history with timestamps; see exactly what each agent has been doing
 - **Cost panel** -- total spend by time window with per-model token and cost breakdown
 - **Config panel** -- browse CLAUDE.md/AGENTS.md, memories, skills, MCP servers, and permissions per session
+- **Subagents panel** -- list the subagents a session dispatched (type, model, description, cost, tools, duration); includes "ghost" rows reconstructed from the parent transcript when Claude Code has purged the subagent's own jsonl. Expand a session row in the list to inspect or drill into each subagent.
 - **OS process metrics** -- CPU% and PID count for running sessions (macOS/Linux/Windows)
 - **Overview sparklines** -- aggregate spend, tokens, and CPU charts at a glance
 - **Detail view** -- full cost breakdown, token split, per-model stats, and complete tool history
@@ -61,7 +62,9 @@ Requires Node.js >= 18. No other dependencies.
 | `Enter` | Open detail view |
 | `Tab` | Cycle bottom panel tabs |
 | `Shift+Tab` or `` ` `` | Toggle Live filter |
-| `1`-`6` | Switch to Info/Performance/Processes/Tool Activity/Cost/Config panel |
+| `1`-`7` | Switch to Info/Performance/Processes/Tool Activity/Cost/Config/Subagents panel |
+| `→` / `Enter` | Expand a session's subagents in the list; on a subagent row, the bottom panels show its data |
+| `←` | Collapse a session's expanded subagents |
 | `F1`, `?`, `h` | Show help |
 | `F3` or `/` | Search/filter sessions |
 | `F5` or `r` | Force refresh |
