@@ -80,6 +80,13 @@ const CODEX_PRICING = {
 };
 
 const CLAUDE_PRICING = {
+  "claude-opus-4-8": {
+    input_per_million: 5.0,
+    cache_write_5m_per_million: 6.25,
+    cache_write_1h_per_million: 10.0,
+    cache_read_per_million: 0.5,
+    output_per_million: 25.0,
+  },
   "claude-opus-4-7": {
     input_per_million: 5.0,
     cache_write_5m_per_million: 6.25,
@@ -243,9 +250,9 @@ OPTIONS
 KEYBOARD SHORTCUTS (interactive mode)
   j/k, arrows            Navigate sessions
   Enter                  Open detail view
-  Tab                    Cycle bottom panel tabs (Info/Performance/Processes/Tool/Cost/Config)
+  Tab                    Cycle bottom panel tabs (Info/Performance/Processes/Tool/Subagents/Cost/Config)
   \`                      Toggle Sessions/Live Sessions list view
-  1-6                    Jump to Info/Performance/Processes/Tool Activity/Cost/Config panel
+  1-7                    Jump to Info/Performance/Processes/Tool Activity/Subagents/Cost/Config panel
   F3 or /                Filter sessions by text
   F6 or >                Sort-by panel
   F7                     Filter sessions by age (1d / 1w / 1mo)
@@ -3702,8 +3709,8 @@ function createState() {
     subagentScroll: 0, // scroll offset in Subagents panel
     // Per-surface sort: bottom Subagents panel and session-list expansion track
     // independently so clicking one doesn't reshuffle the other.
-    subagentSortPanel: { col: "start", asc: false }, // bottom Subagents panel
-    subagentSortList:  { col: "start", asc: false }, // session-list expansion
+    subagentSortPanel: { col: "last", asc: false }, // bottom Subagents panel
+    subagentSortList:  { col: "last", asc: false }, // session-list expansion
     _subagentColRanges: {},    // bottom panel header click ranges
     _subagentExpColRanges: {}, // list expansion header click ranges
     expandedSubagents: new Set(), // session keys ("provider:session_id") with subagents expanded in the list
@@ -3864,6 +3871,7 @@ function computeStats(sessions) {
     spendTotal: spendClaude + spendCodex,
     spendClaude, spendCodex,
     spendHour, spendToday, spendWeek, spendMonth,
+    spendCalendarMonth: monthlyDaily.reduce((a, b) => a + b, 0), // spend since the 1st of this calendar month
     dailyHourly,   // 24 entries: today's spend per hour (0..23)
     monthlyDaily,  // N entries: this month's spend per day (1..daysInMonth)
     models,
@@ -3941,7 +3949,7 @@ function sessionKey(s) {
  *  session-list expansion so a single state.subagentSort drives both surfaces.
  *  `key` is what's stored in state, `extract` returns the comparable value. */
 const SUBAGENT_SORT_COLS = {
-  start: { extract: (sa) => sa.started_at || "" },
+  last:  { extract: (sa) => sa.last_active || sa.started_at || "" },
   type:  { extract: (sa) => sa.type || "" },
   model: { extract: (sa) => sa.model || "" },
   desc:  { extract: (sa) => sa.description || "" },
@@ -3953,9 +3961,9 @@ const SUBAGENT_SORT_COLS = {
 
 /** Sort a list of subagents according to state.subagentSort, leaving the input untouched. */
 function sortSubagents(subs, sort) {
-  const col = (sort && sort.col) || "start";
+  const col = (sort && sort.col) || "last";
   const asc = !!(sort && sort.asc);
-  const def = SUBAGENT_SORT_COLS[col] || SUBAGENT_SORT_COLS.start;
+  const def = SUBAGENT_SORT_COLS[col] || SUBAGENT_SORT_COLS.last;
   const out = subs.slice();
   out.sort((a, b) => {
     const va = def.extract(a);
@@ -3970,19 +3978,11 @@ function sortSubagents(subs, sort) {
 
 /** Build the virtual row list: each session, plus a marker + child rows when expanded. */
 function buildFlatList(state) {
+  // Sessions only — subagents live in the Subagents bottom-panel tab, not as
+  // expandable rows in the sessions list.
   const flat = [];
-  const expanded = state.expandedSubagents || new Set();
   for (const s of state.filtered) {
     flat.push({ type: "session", session: s });
-    const subs = Array.isArray(s.list_subagents) ? s.list_subagents : null;
-    if (subs && subs.length > 0) {
-      const isExpanded = expanded.has(sessionKey(s));
-      flat.push({ type: "marker", session: s, expanded: isExpanded, count: subs.length });
-      if (isExpanded) {
-        flat.push({ type: "subagent-header", session: s });
-        for (const sa of sortSubagents(subs, state.subagentSortList)) flat.push({ type: "subagent", session: s, subagent: sa });
-      }
-    }
   }
   return flat;
 }
@@ -4149,7 +4149,7 @@ function renderHeader(stats, width, state) {
     ? _globalSpendDeltaHist[_globalSpendDeltaHist.length - 1]
     : 0;
   const spendToday = stats.spendToday || 0;
-  const spendMonth = stats.spendMonth || 0;
+  const spendMonth = stats.spendCalendarMonth || 0;
   const memMB = (stats.totalMemory || 0) / (1024 * 1024);
 
   const inner = width - 4; // inside box borders
@@ -4530,11 +4530,11 @@ function renderSubagentChildRow(sa, isSelected, width, hScroll, state) {
   const isRunning = sa.status === "running";
   const icon = isGhost ? "◌" : (isRunning ? "●" : "○");
   const iconColor = isSelected ? "" : (isGhost ? C.dimText : (isRunning ? C.chartBarHi : C.dimText));
-  const ts = sa.started_at ? new Date(sa.started_at) : null;
-  // 6-char column (matches the START header width): HH:MM left-aligned + trailing space.
-  const startStr = ((ts && !isNaN(ts.getTime()))
-    ? String(ts.getHours()).padStart(2, "0") + ":" + String(ts.getMinutes()).padStart(2, "0")
-    : "  —  ".slice(0, 5)).padEnd(6);
+  const lastTs = sa.last_active || sa.started_at;
+  // 6-char column (matches the LAST header width): relative age, left-aligned.
+  const startStr = (lastTs
+    ? relativeAge(lastTs, new Date())
+    : "—").padEnd(6);
   const cost = (isGhost || typeof sa.cost !== "number")
     ? "      —"   // 7-char column, right-aligned em-dash to match $N.NN values
     : ("$" + sa.cost.toFixed(2)).padStart(7);
@@ -4565,10 +4565,10 @@ function renderSubagentChildRow(sa, isSelected, width, hScroll, state) {
   const costNum = typeof sa.cost === "number" ? sa.cost : Number(sa.cost) || 0;
   const costCol  = isSelected || isGhost ? rowColor : costColor(costNum);
   const modelCol = isSelected || isGhost ? rowColor : modelColor({ model: sa.model || "" });
-  // START column mirrors the parent's LAST column: ageDimColor on dispatch time.
+  // LAST column mirrors the parent's LAST column: ageDimColor on last activity.
   const startCol = isSelected || isGhost
     ? rowColor
-    : ageDimColor({ last_active: sa.started_at, process: isRunning }, new Date());
+    : ageDimColor({ last_active: lastTs, process: isRunning }, new Date());
   // DUR thresholds: ≤10m row color, >10m yellow, >30m red.
   const durMs = sa.duration_ms || 0;
   const durCol = isSelected || isGhost
@@ -4595,13 +4595,13 @@ function renderSubagentHeaderRow(isSelected, width, hScroll, state) {
   const fg = isSelected ? C.selFg : "";
   const base = bg + fg;
   const indent = "       "; // 5sp indent + 1ch icon-placeholder + 1sp gap
-  const sort = state.subagentSortList || { col: "start", asc: false };
+  const sort = state.subagentSortList || { col: "last", asc: false };
   const arrow = (k) => k === sort.col ? (sort.asc ? "▲" : "▼") : "";
   // Each column width ≥ label.length + 1 so the active sort's ▲/▼ fits next to
   // the label without ever cropping it. Data cells in renderSubagentChildRow
   // pad to the same widths so columns stay aligned.
   const segs = [
-    { key: "start", text: "START",       width: 6,  align: "left",  gap: 2 },
+    { key: "last",  text: "LAST",        width: 6,  align: "left",  gap: 2 },
     { key: "dur",   text: "DUR",         width: 6,  align: "right", gap: 2 },
     { key: "cost",  text: "COST",        width: 7,  align: "right", gap: 2 },
     { key: "tools", text: "TOOLS",       width: 6,  align: "right", gap: 2 },
@@ -4830,10 +4830,10 @@ const MAX_PANEL = 30;
  * Build content lines for each of the three bottom panels, then merge
  * them side-by-side with box borders into composite screen lines.
  */
-const BOTTOM_TABS = ["Info", "Performance", "Processes", "Tool Activity", "Cost", "Config", "Subagents"];
+const BOTTOM_TABS = ["Info", "Performance", "Processes", "Tool Activity", "Subagents", "Cost", "Config"];
 // Tabs that are hidden unless the session has data for them. Map: tabIdx → predicate(data).
 const CONDITIONAL_TABS = {
-  6: (data) => !!(data && Array.isArray(data.subagents) && data.subagents.length > 0),
+  4: (data) => !!(data && Array.isArray(data.subagents) && data.subagents.length > 0),
 };
 
 /** Return the indices of BOTTOM_TABS visible for this session's data, in display order. */
@@ -4940,9 +4940,9 @@ function renderBottomPanels(session, data, plan, width, panelHeight, activeTab, 
     case 1: contentLines = renderSystemPanel(session, data, width, innerH); break;
     case 2: contentLines = renderProcessesPanel(session, width, innerH, state); break;
     case 3: contentLines = renderAgentPanel(session, data, width, innerH, state); break;
-    case 4: contentLines = renderCostPanel(session, data, plan, width, innerH, state.costScroll, state); break;
-    case 5: contentLines = renderConfigPanel(session, width, innerH, state); break;
-    case 6: contentLines = renderSubagentsPanel(session, data, width, innerH, state); break;
+    case 4: contentLines = renderSubagentsPanel(session, data, width, innerH, state); break;
+    case 5: contentLines = renderCostPanel(session, data, plan, width, innerH, state.costScroll, state); break;
+    case 6: contentLines = renderConfigPanel(session, width, innerH, state); break;
     default: contentLines = renderSessionInfoPanel(session, data, plan, width, innerH);
   }
 
@@ -5876,12 +5876,11 @@ function renderSubagentsPanel(session, data, panelW, rows, state) {
   const fixedW = startW + 1 + 1 + 1 + typeW + 1 + modelW + 1 + 1 + costW + 1 + toolsW + 1 + ctxW + 1 + timeW;
   const descW = Math.max(10, w - fixedW);
 
-  const fmtStart = (ts) => {
+  const nowDate = new Date();
+  const fmtLast = (ts) => {
     if (!ts) return "—".padStart(startW);
-    const d = new Date(ts);
-    if (isNaN(d.getTime())) return "?".padStart(startW);
-    const t = String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
-    return t.padEnd(startW);
+    const s = relativeAge(ts, nowDate);
+    return s.padEnd(startW);
   };
 
   const shortModel = (m) => (m || "?")
@@ -5913,12 +5912,12 @@ function renderSubagentsPanel(session, data, panelW, rows, state) {
   // Active sort column gets a ▲/▼ arrow. Per-column click ranges are recorded so
   // the click handler can map a mouse col → sort key.
   const hdr = C.colHdrBg;
-  const sort = state.subagentSortPanel || { col: "start", asc: false };
+  const sort = state.subagentSortPanel || { col: "last", asc: false };
   const arrow = (k) => k === sort.col ? (sort.asc ? "▲" : "▼") : "";
   const ranges = {};
   // Each segment: { key, text, width, align ("left"|"right"), gap (chars after) }
   const segs = [
-    { key: "start", text: "START", width: startW, align: "left",  gap: 3 },
+    { key: "last",  text: "LAST",  width: startW, align: "left",  gap: 3 },
     { key: "type",  text: "TYPE",  width: typeW,  align: "left",  gap: 1 },
     { key: "model", text: "MODEL", width: modelW, align: "left",  gap: 1 },
     { key: "desc",  text: "DESC",  width: descW,  align: "left",  gap: 1 },
@@ -5998,10 +5997,11 @@ function renderSubagentsPanel(session, data, panelW, rows, state) {
       : ctxPct > 0  ? C.chartBarLow
       : C.dimText;
     const modelColForCol = isGhost ? rowColor : modelColor({ model: sa.model || "" });
-    // START column mirrors the parent's LAST column: ageDimColor on dispatch time.
+    // LAST column mirrors the parent's LAST column: ageDimColor on last activity.
+    const lastTs = sa.last_active || sa.started_at;
     const startColForCol = isGhost
       ? C.dimText
-      : ageDimColor({ last_active: sa.started_at, process: isRunning }, new Date());
+      : ageDimColor({ last_active: lastTs, process: isRunning }, nowDate);
     // DUR/TIME thresholds: ≤10m row color, >10m yellow, >30m red.
     const durMs = sa.duration_ms || 0;
     const timeColForCol = isGhost
@@ -6009,7 +6009,7 @@ function renderSubagentsPanel(session, data, panelW, rows, state) {
       : durMs > 1800000 ? C.costRed
       : durMs > 600000  ? C.costYellow
       : rowColor;
-    const startStr = fmtStart(sa.started_at);
+    const startStr = fmtLast(lastTs);
     lines.push(
       startColForCol + startStr + RESET + " " +
       statusIcon + " " +
@@ -6182,7 +6182,7 @@ function renderHelpView(width, height) {
   lines.push("");
   lines.push(BOLD + "  Tabs:" + RESET);
   lines.push("    Tab              Cycle bottom panel tabs");
-  lines.push("    1-6              Switch to Info/Performance/Processes/Tool Activity/Cost/Config");
+  lines.push("    1-7              Switch to Info/Performance/Processes/Tool Activity/Subagents/Cost/Config");
   lines.push("    Shift+Tab / `    Toggle Live filter (show only running sessions)");
   lines.push("");
   lines.push(BOLD + "  Other:" + RESET);
@@ -7364,9 +7364,9 @@ function handleEvent(event, state) {
         if (state.infoScroll > 0) { state.infoScroll--; state.dirty = true; }
       } else if (state.bottomTab === 2 && state._configPanelTop && event.row >= state._configPanelTop) {
         if (state.procScroll > 0) { state.procScroll--; state.dirty = true; }
-      } else if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
-        if (state.costScroll > 0) { state.costScroll--; state.dirty = true; }
       } else if (state.bottomTab === 5 && state._configPanelTop && event.row >= state._configPanelTop) {
+        if (state.costScroll > 0) { state.costScroll--; state.dirty = true; }
+      } else if (state.bottomTab === 6 && state._configPanelTop && event.row >= state._configPanelTop) {
         if (state.configScroll > 0) { state.configScroll--; state.dirty = true; }
       } else if (state.bottomTab === 3 && state._configPanelTop && event.row >= state._configPanelTop) {
         const hoverCol = event.col - 2;
@@ -7376,7 +7376,7 @@ function handleEvent(event, state) {
         } else {
           if (state.agentToolScroll > 0) { state.agentToolScroll--; state.dirty = true; }
         }
-      } else if (state.bottomTab === 6 && state._configPanelTop && event.row >= state._configPanelTop) {
+      } else if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
         if ((state.subagentScroll || 0) > 0) { state.subagentScroll = (state.subagentScroll || 0) - 1; state.dirty = true; }
       } else {
         if (state.selectedRow > 0) { state.selectedRow--; state.dirty = true; }
@@ -7387,9 +7387,9 @@ function handleEvent(event, state) {
         state.infoScroll++; state.dirty = true; // clamped in render
       } else if (state.bottomTab === 2 && state._configPanelTop && event.row >= state._configPanelTop) {
         state.procScroll++; state.dirty = true; // clamped in render
-      } else if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
-        state.costScroll++; state.dirty = true; // clamped in render
       } else if (state.bottomTab === 5 && state._configPanelTop && event.row >= state._configPanelTop) {
+        state.costScroll++; state.dirty = true; // clamped in render
+      } else if (state.bottomTab === 6 && state._configPanelTop && event.row >= state._configPanelTop) {
         state.configScroll++; state.dirty = true; // clamped in render
       } else if (state.bottomTab === 3 && state._configPanelTop && event.row >= state._configPanelTop) {
         const hoverCol = event.col - 2;
@@ -7398,7 +7398,7 @@ function handleEvent(event, state) {
         } else {
           state.agentToolScroll++; state.dirty = true; // clamped in render
         }
-      } else if (state.bottomTab === 6 && state._configPanelTop && event.row >= state._configPanelTop) {
+      } else if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
         state.subagentScroll = (state.subagentScroll || 0) + 1; state.dirty = true; // clamped in render
       } else {
         if (state.selectedRow < listLen - 1) { state.selectedRow++; state.dirty = true; }
@@ -7591,15 +7591,15 @@ function handleEvent(event, state) {
         }
       }
       // Check if click is in Subagents panel header (sort) — bottomTab 6
-      if (state.bottomTab === 6 && state._configPanelTop && event.row === state._configPanelTop) {
+      if (state.bottomTab === 4 && state._configPanelTop && event.row === state._configPanelTop) {
         const innerCol = event.col - 3; // border "│ " + 1-based → 0-based inner column
         const ranges = state._subagentColRanges || {};
         for (const k of Object.keys(ranges)) {
           const [a, b] = ranges[k];
           if (innerCol >= a && innerCol <= b) {
-            const cur = state.subagentSortPanel || { col: "start", asc: false };
+            const cur = state.subagentSortPanel || { col: "last", asc: false };
             if (cur.col === k) state.subagentSortPanel = { col: k, asc: !cur.asc };
-            else state.subagentSortPanel = { col: k, asc: k === "start" ? false : true };
+            else state.subagentSortPanel = { col: k, asc: k === "last" ? false : true };
             saveUiPrefs({ subagentSortPanel: state.subagentSortPanel });
             state.dirty = true;
             return;
@@ -7607,7 +7607,7 @@ function handleEvent(event, state) {
         }
       }
       // Check if click is in Cost panel scrollbar
-      if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
+      if (state.bottomTab === 5 && state._configPanelTop && event.row >= state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
         const sb = state._costScrollbar;
         if (sb && event.col === sb.col) {
@@ -7627,7 +7627,7 @@ function handleEvent(event, state) {
         }
       }
       // Check if click is in Config panel area
-      if (state.bottomTab === 5 && state._configPanelTop && event.row >= state._configPanelTop) {
+      if (state.bottomTab === 6 && state._configPanelTop && event.row >= state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
         const selected = getSelectedSession(state);
         const sections = getSessionConfig(selected);
@@ -7697,9 +7697,9 @@ function handleEvent(event, state) {
             for (const k of Object.keys(ranges)) {
               const [a, b] = ranges[k];
               if (innerCol >= a && innerCol <= b) {
-                const cur = state.subagentSortList || { col: "start", asc: false };
+                const cur = state.subagentSortList || { col: "last", asc: false };
                 if (cur.col === k) state.subagentSortList = { col: k, asc: !cur.asc };
-                else state.subagentSortList = { col: k, asc: k === "start" ? false : true };
+                else state.subagentSortList = { col: k, asc: k === "last" ? false : true };
                 saveUiPrefs({ subagentSortList: state.subagentSortList });
                 state.flatList = buildFlatList(state);
                 return;
@@ -7747,7 +7747,7 @@ function handleEvent(event, state) {
           state.dirty = true;
         }
       }
-      if (state.bottomTab === 4 && state._configPanelTop) {
+      if (state.bottomTab === 5 && state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
         const sb = state._costScrollbar;
         if (sb && event.col === sb.col && rowInPanel >= sb.thumbStart && rowInPanel < sb.thumbEnd) {
@@ -7758,7 +7758,7 @@ function handleEvent(event, state) {
           state.dirty = true;
         }
       }
-      if (state.bottomTab === 5 && state._configPanelTop) {
+      if (state.bottomTab === 6 && state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
         const selected = getSelectedSession(state);
         const sections = getSessionConfig(selected);

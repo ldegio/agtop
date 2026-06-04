@@ -62,7 +62,7 @@ Requires Node.js >= 18. No other dependencies.
 | `Enter` | Open detail view |
 | `Tab` | Cycle bottom panel tabs |
 | `Shift+Tab` or `` ` `` | Toggle Live filter |
-| `1`-`7` | Switch to Info/Performance/Processes/Tool Activity/Cost/Config/Subagents panel |
+| `1`-`7` | Switch to Info/Performance/Processes/Tool Activity/Subagents/Cost/Config panel |
 | `→` / `Enter` | Expand a session's subagents in the list; on a subagent row, the bottom panels show its data |
 | `←` | Collapse a session's expanded subagents |
 | `F1`, `?`, `h` | Show help |
