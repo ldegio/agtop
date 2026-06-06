@@ -51,8 +51,13 @@ const HOME = homedir();
 const CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || join(HOME, ".claude");
 const CODEX_SESSIONS_ROOT = join(HOME, ".codex", "sessions");
 const CLAUDE_PROJECTS_ROOT = join(CLAUDE_CONFIG_DIR, "projects");
+// Cowork (VM) sessions — ~/Library/Application Support/Claude/local-agent-mode-sessions/
 const CLAUDE_MAC_SESSIONS_ROOT = process.platform === "darwin"
   ? join(HOME, "Library", "Application Support", "Claude", "local-agent-mode-sessions")
+  : null;
+// Code (local) sessions — ~/Library/Application Support/Claude/claude-code-sessions/
+const CLAUDE_MAC_CODE_ROOT = process.platform === "darwin"
+  ? join(HOME, "Library", "Application Support", "Claude", "claude-code-sessions")
   : null;
 const UUID_RE = /([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/;
 const FULL_UUID_RE = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
@@ -786,14 +791,27 @@ function findDesktopSessionJsonl(sessionDir, cliSessionId) {
   return null;
 }
 
-/** List sessions from Claude for Mac (Code + Cowork) stored under
- *  ~/Library/Application Support/Claude/local-agent-mode-sessions/. */
+/** List sessions from Claude for Mac (Code + Cowork).
+ *  Code sessions: ~/Library/Application Support/Claude/claude-code-sessions/
+ *  Cowork sessions: ~/Library/Application Support/Claude/local-agent-mode-sessions/ */
 function listClaudeMacSessions() {
-  if (!CLAUDE_MAC_SESSIONS_ROOT || !dirExists(CLAUDE_MAC_SESSIONS_ROOT)) return [];
   const sessions = [];
-  for (const accountId of listDir(CLAUDE_MAC_SESSIONS_ROOT)) {
+  // Scan both roots; forceSurface overrides vmProcessName-based detection for code root
+  const roots = [
+    { root: CLAUDE_MAC_SESSIONS_ROOT, forceSurface: null },
+    { root: CLAUDE_MAC_CODE_ROOT,     forceSurface: "desktop-code" },
+  ];
+  for (const { root, forceSurface } of roots) {
+    if (!root || !dirExists(root)) continue;
+    _scanMacSessionsRoot(root, forceSurface, sessions);
+  }
+  return sessions;
+}
+
+function _scanMacSessionsRoot(root, forceSurface, sessions) {
+  for (const accountId of listDir(root)) {
     if (accountId === "skills-plugin") continue;
-    const accountDir = join(CLAUDE_MAC_SESSIONS_ROOT, accountId);
+    const accountDir = join(root, accountId);
     if (!dirExists(accountDir)) continue;
     for (const deviceId of listDir(accountDir)) {
       const deviceDir = join(accountDir, deviceId);
@@ -813,8 +831,7 @@ function listClaudeMacSessions() {
         if (!summary.model && !meta.model) continue; // skip empty sessions
         sessions.push({
           provider: "claude",
-          // vmProcessName present → Cowork (VM); absent → local Code session
-          surface: meta.vmProcessName ? "desktop-cowork" : "desktop-code",
+          surface: forceSurface || (meta.vmProcessName ? "desktop-cowork" : "desktop-code"),
           session_id: cliSessionId,
           started_at: new Date(meta.createdAt).toISOString(),
           last_active: new Date(meta.lastActivityAt || meta.createdAt).toISOString(),
