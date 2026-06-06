@@ -51,6 +51,9 @@ const HOME = homedir();
 const CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || join(HOME, ".claude");
 const CODEX_SESSIONS_ROOT = join(HOME, ".codex", "sessions");
 const CLAUDE_PROJECTS_ROOT = join(CLAUDE_CONFIG_DIR, "projects");
+const CLAUDE_MAC_SESSIONS_ROOT = process.platform === "darwin"
+  ? join(HOME, "Library", "Application Support", "Claude", "local-agent-mode-sessions")
+  : null;
 const UUID_RE = /([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/;
 const FULL_UUID_RE = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const SESSION_DATA_CACHE = new Map();
@@ -740,26 +743,89 @@ function summarizeClaudeSession(transcriptPath) {
 }
 
 function listClaudeSessions() {
-  if (!dirExists(CLAUDE_PROJECTS_ROOT)) return [];
   const sessions = [];
-  for (const projectName of listDir(CLAUDE_PROJECTS_ROOT)) {
-    const projectDir = join(CLAUDE_PROJECTS_ROOT, projectName);
-    if (!dirExists(projectDir)) continue;
-    for (const entry of listDir(projectDir)) {
-      if (!entry.endsWith(".jsonl")) continue;
-      const stem = entry.replace(/\.jsonl$/, "");
-      if (!FULL_UUID_RE.test(stem)) continue;
-      try {
-        const s = summarizeClaudeSession(join(projectDir, entry));
-        if (!s.model) continue; // skip empty/abandoned sessions
-        sessions.push(s);
-      } catch (err) {
-        if (err instanceof SessionCostError) continue;
-        throw err;
+  if (dirExists(CLAUDE_PROJECTS_ROOT)) {
+    for (const projectName of listDir(CLAUDE_PROJECTS_ROOT)) {
+      const projectDir = join(CLAUDE_PROJECTS_ROOT, projectName);
+      if (!dirExists(projectDir)) continue;
+      for (const entry of listDir(projectDir)) {
+        if (!entry.endsWith(".jsonl")) continue;
+        const stem = entry.replace(/\.jsonl$/, "");
+        if (!FULL_UUID_RE.test(stem)) continue;
+        try {
+          const s = summarizeClaudeSession(join(projectDir, entry));
+          if (!s.model) continue; // skip empty/abandoned sessions
+          sessions.push(s);
+        } catch (err) {
+          if (err instanceof SessionCostError) continue;
+          throw err;
+        }
       }
     }
   }
+  // Merge Claude for Mac (Code + Cowork) sessions alongside CLI sessions
+  sessions.push(...listClaudeMacSessions());
   sessions.sort((a, b) => (b.started_at || "").localeCompare(a.started_at || ""));
+  return sessions;
+}
+
+/** Find the Claude Code JSONL for a desktop session given its directory and cliSessionId. */
+function findDesktopSessionJsonl(sessionDir, cliSessionId) {
+  const projectsDir = join(sessionDir, ".claude", "projects");
+  if (!dirExists(projectsDir)) return null;
+  for (const projectName of listDir(projectsDir)) {
+    const projectDir = join(projectsDir, projectName);
+    if (!dirExists(projectDir)) continue;
+    const candidate = join(projectDir, cliSessionId + ".jsonl");
+    try { statSync(candidate); return candidate; } catch {}
+    // Fallback: scan all jsonl files (cliSessionId may differ in edge cases)
+    for (const entry of listDir(projectDir)) {
+      if (entry.endsWith(".jsonl") && entry.startsWith(cliSessionId)) return join(projectDir, entry);
+    }
+  }
+  return null;
+}
+
+/** List sessions from Claude for Mac (Code + Cowork) stored under
+ *  ~/Library/Application Support/Claude/local-agent-mode-sessions/. */
+function listClaudeMacSessions() {
+  if (!CLAUDE_MAC_SESSIONS_ROOT || !dirExists(CLAUDE_MAC_SESSIONS_ROOT)) return [];
+  const sessions = [];
+  for (const accountId of listDir(CLAUDE_MAC_SESSIONS_ROOT)) {
+    if (accountId === "skills-plugin") continue;
+    const accountDir = join(CLAUDE_MAC_SESSIONS_ROOT, accountId);
+    if (!dirExists(accountDir)) continue;
+    for (const deviceId of listDir(accountDir)) {
+      const deviceDir = join(accountDir, deviceId);
+      if (!dirExists(deviceDir)) continue;
+      for (const entry of listDir(deviceDir)) {
+        if (!entry.startsWith("local_") || !entry.endsWith(".json")) continue;
+        const metaPath = join(deviceDir, entry);
+        let meta;
+        try { meta = JSON.parse(readFileSync(metaPath, "utf-8")); } catch { continue; }
+        if (meta.isArchived) continue;
+        const cliSessionId = meta.cliSessionId;
+        if (!cliSessionId) continue;
+        const sessionDir = join(deviceDir, meta.sessionId || entry.replace(/\.json$/, ""));
+        const jsonlPath = findDesktopSessionJsonl(sessionDir, cliSessionId);
+        if (!jsonlPath) continue; // no transcript yet
+        const summary = collectClaudeSessionSummary(jsonlPath);
+        if (!summary.model && !meta.model) continue; // skip empty sessions
+        sessions.push({
+          provider: "claude",
+          surface: "desktop",
+          session_id: cliSessionId,
+          started_at: new Date(meta.createdAt).toISOString(),
+          last_active: new Date(meta.lastActivityAt || meta.createdAt).toISOString(),
+          model: summary.model || meta.model || null,
+          label_source: (meta.userSelectedFolders && meta.userSelectedFolders[0]) || meta.cwd || "",
+          data_file: jsonlPath,
+          title: meta.title || summary.customTitle || summary.aiTitle || null,
+          _mac_meta: { sessionId: meta.sessionId, metaPath, sessionDir },
+        });
+      }
+    }
+  }
   return sessions;
 }
 
@@ -966,20 +1032,25 @@ function formatConfigFile(filePath, displayPath, maxLines) {
 function extractClaudeConfig(session) {
   const sections = []; // [{label, lines, copyPath}]
 
+  // Desktop sessions use their session-local .claude/ directory; CLI sessions use CLAUDE_CONFIG_DIR.
+  const configRoot = (session.surface === "desktop" && session._mac_meta)
+    ? join(session._mac_meta.sessionDir, ".claude")
+    : CLAUDE_CONFIG_DIR;
+
   const projectName = session.data_file
     ? basename(dirname(session.data_file))
     : null;
   const projectMemDir = projectName
-    ? join(CLAUDE_CONFIG_DIR, "projects", projectName, "memory")
+    ? join(configRoot, "projects", projectName, "memory")
     : null;
   const cwd = session.label_source || "";
 
   // 1. CLAUDE.md files
   const claudeMdLines = [];
-  const globalCmPath = join(CLAUDE_CONFIG_DIR, "CLAUDE.md");
-  const globalCmBlock = formatConfigFile(globalCmPath, CLAUDE_CONFIG_DIR + "/CLAUDE.md");
+  const globalCmPath = join(configRoot, "CLAUDE.md");
+  const globalCmBlock = formatConfigFile(globalCmPath, configRoot + "/CLAUDE.md");
   if (globalCmBlock) claudeMdLines.push(...globalCmBlock);
-  else claudeMdLines.push(notFoundLine(CLAUDE_CONFIG_DIR + "/CLAUDE.md not found"));
+  else claudeMdLines.push(notFoundLine(configRoot + "/CLAUDE.md not found"));
 
   if (cwd) {
     const projCmPath = join(cwd, "CLAUDE.md");
@@ -1015,7 +1086,7 @@ function extractClaudeConfig(session) {
 
   // 3. Skills
   const skillLines = [];
-  const skillsDirPath = join(CLAUDE_CONFIG_DIR, "skills");
+  const skillsDirPath = join(configRoot, "skills");
   if (dirExists(skillsDirPath)) {
     for (const d of listDir(skillsDirPath)) {
       const skillMd = safeReadFile(join(skillsDirPath, d, "SKILL.md"), 4096);
@@ -1030,12 +1101,12 @@ function extractClaudeConfig(session) {
       }
     }
   }
-  if (skillLines.length === 0) skillLines.push(notFoundLine(`No skills installed (${CLAUDE_CONFIG_DIR}/skills/)`));
+  if (skillLines.length === 0) skillLines.push(notFoundLine(`No skills installed (${configRoot}/skills/)`));
   sections.push({ label: "Skills", lines: skillLines, copyPath: skillsDirPath });
 
   // 4. MCP Servers
   const mcpLines = [];
-  const settingsPath = join(CLAUDE_CONFIG_DIR, "settings.json");
+  const settingsPath = join(configRoot, "settings.json");
   const settingsContent = safeReadFile(settingsPath);
   if (settingsContent) {
     try {
@@ -1071,7 +1142,7 @@ function extractClaudeConfig(session) {
   // 5. Permissions
   const permLines = [];
   const permFiles = [
-    { path: join(CLAUDE_CONFIG_DIR, "settings.json"), label: "global" },
+    { path: join(configRoot, "settings.json"), label: "global" },
   ];
   if (cwd) {
     permFiles.push({ path: join(cwd, ".claude", "settings.json"), label: "project" });
@@ -2247,9 +2318,13 @@ function extractContextUsage(session) {
       // Priority: local project > project > global
       let settingsCtx = 0;
       const cwd = session.label_source;
+      // Desktop sessions use session-local .claude/; CLI sessions use CLAUDE_CONFIG_DIR
+      const configRoot = (session.surface === "desktop" && session._mac_meta)
+        ? join(session._mac_meta.sessionDir, ".claude")
+        : CLAUDE_CONFIG_DIR;
       const settingsFiles = [
         ...(cwd ? [join(cwd, ".claude", "settings.local.json"), join(cwd, ".claude", "settings.json")] : []),
-        join(CLAUDE_CONFIG_DIR, "settings.json"),
+        join(configRoot, "settings.json"),
       ];
       for (const sf of settingsFiles) {
         try {
@@ -4402,6 +4477,8 @@ function renderSessionRow(session, index, isSelected, width, now, hScroll, state
       }
     } else if (col.key === "active") {
       colColor = ageDimColor(session, now);
+    } else if (col.key === "project" && session.surface === "desktop") {
+      colColor = "\x1b[38;5;141m"; // light purple for desktop sessions
     } else if (col.key === "model") {
       colColor = modelColor(session);
     } else if (col.key === "cost") {
@@ -4692,7 +4769,8 @@ function renderFooter(state, width) {
 function renderDetailView(session, data, plan, width, height) {
   const lines = [];
 
-  const prov = session.provider === "claude" ? "Claude" : "Codex";
+  const prov = session.surface === "desktop" ? "Claude Desktop"
+    : session.provider === "claude" ? "Claude" : "Codex";
   lines.push(boxTop(width - 1, `Session Detail — ${prov} ${session.session_id || "unknown"}`));
   lines.push("");
 
@@ -4983,7 +5061,8 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows, scrollTop, st
   const lines = allLines;
 
   session._copyTargets = [];
-  const prov = session.provider === "claude" ? "Claude" : "Codex";
+  const prov = session.surface === "desktop" ? "Claude Desktop"
+    : session.provider === "claude" ? "Claude" : "Codex";
   const sid = session.session_id || "unknown";
   const pm = session.process;
   const now = Date.now();
@@ -5039,13 +5118,16 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows, scrollTop, st
   // ── Build left and right field sets ──
   const m = safeMetrics(data);
   const displayModel = data.lastModel || session.model || (data.models || [data.model])[0] || "?";
-  const provColor = session.provider === "claude" ? "\x1b[38;5;173m" : "\x1b[38;5;110m";
+  const isDesktop = session.surface === "desktop";
+  const provColor = isDesktop ? "\x1b[38;5;141m"
+    : session.provider === "claude" ? "\x1b[38;5;173m"
+    : "\x1b[38;5;110m";
   const ml = displayModel.toLowerCase();
   const mdlColor = ml.startsWith("claude") ? "\x1b[38;5;173m"
     : (ml.startsWith("gpt") || ml.startsWith("o1") || ml.startsWith("o3") || ml.startsWith("o4")) ? "\x1b[38;5;110m"
     : C.hdrValue;
 
-  const fullCmd = (pm && pm.command) || (session.provider === "claude" ? `claude --resume ${sid}` : `codex resume ${sid}`);
+  const fullCmd = (pm && pm.command) || (session.provider === "claude" ? `claude --resume ${session.title || sid}` : `codex resume ${sid}`);
   const title = data.title || session.title;
   const proj = session.label_source || "unknown";
   const acct = session.provider === "claude" ? readClaudeAccount() : readCodexAccount();
@@ -6225,6 +6307,12 @@ function deleteSession(session) {
     // Remove subagent dir (same stem as the .jsonl)
     const stem = f.replace(/\.jsonl$/, "");
     try { rmSync(stem, { recursive: true, force: true }); } catch {}
+    // Desktop sessions: also remove the local_<uuid>.json metadata file
+    // and the local_<uuid>/ working directory so the session isn't rediscovered.
+    if (session.surface === "desktop" && session._mac_meta) {
+      try { rmSync(session._mac_meta.metaPath); } catch {}
+      try { rmSync(session._mac_meta.sessionDir, { recursive: true, force: true }); } catch {}
+    }
   } else {
     // Codex: just the single JSONL file
     try { rmSync(f); } catch {}
@@ -8164,6 +8252,7 @@ async function main() {
           const acct = s.provider === "claude" ? readClaudeAccount() : readCodexAccount();
           const obj = {
             provider: s.provider,
+            surface: s.surface || null,
             session_id: s.session_id,
             started_at: s.started_at,
             last_active: s.last_active,
