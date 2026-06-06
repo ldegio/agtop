@@ -813,7 +813,8 @@ function listClaudeMacSessions() {
         if (!summary.model && !meta.model) continue; // skip empty sessions
         sessions.push({
           provider: "claude",
-          surface: "desktop",
+          // hostLoopMode=true → local Code session; absent/false → Cowork (VM)
+          surface: meta.hostLoopMode ? "desktop-code" : "desktop-cowork",
           session_id: cliSessionId,
           started_at: new Date(meta.createdAt).toISOString(),
           last_active: new Date(meta.lastActivityAt || meta.createdAt).toISOString(),
@@ -1033,7 +1034,7 @@ function extractClaudeConfig(session) {
   const sections = []; // [{label, lines, copyPath}]
 
   // Desktop sessions use their session-local .claude/ directory; CLI sessions use CLAUDE_CONFIG_DIR.
-  const configRoot = (session.surface === "desktop" && session._mac_meta)
+  const configRoot = (isDesktopSession(session) && session._mac_meta)
     ? join(session._mac_meta.sessionDir, ".claude")
     : CLAUDE_CONFIG_DIR;
 
@@ -2319,7 +2320,7 @@ function extractContextUsage(session) {
       let settingsCtx = 0;
       const cwd = session.label_source;
       // Desktop sessions use session-local .claude/; CLI sessions use CLAUDE_CONFIG_DIR
-      const configRoot = (session.surface === "desktop" && session._mac_meta)
+      const configRoot = (isDesktopSession(session) && session._mac_meta)
         ? join(session._mac_meta.sessionDir, ".claude")
         : CLAUDE_CONFIG_DIR;
       const settingsFiles = [
@@ -3315,6 +3316,13 @@ function bfsDescendants(rootPid, childrenByPpid) {
 
 // Extract session UUID from Claude/Codex command line args.
 const RESUME_UUID_RE = /\bresume\s+([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})/;
+// Claude for Mac launches sessions as: claude --resume <title>  (title, not UUID)
+const RESUME_TITLE_RE = /\bresume\s+(.+)$/;
+
+/** True for any Claude for Mac session (Code or Cowork). */
+function isDesktopSession(session) {
+  return session && (session.surface === "desktop-code" || session.surface === "desktop-cowork");
+}
 // Match "claude" / "codex" as a command (binary name), not as part of a path
 // like ~/.claude/projects/... — require start-of-string or "/" before, whitespace
 // or end-of-string after, so ".claude/" in a path does NOT match.
@@ -3604,8 +3612,23 @@ async function collectProcessMetrics(sessions) {
       const key = `${provider}:${uuid}`;
       rootPids.set(key, pid);
     } else {
-      if (isClaudeProc) unmappedClaude.push(pid);
-      else unmappedCodex.push(pid);
+      // Try title-based match for Claude for Mac sessions (claude --resume <title>)
+      const titleMatch = isClaudeProc && args.match(RESUME_TITLE_RE);
+      if (titleMatch) {
+        const resumeTitle = titleMatch[1].trim();
+        const desktopSession = sessions.find(
+          s => isDesktopSession(s) && s.title && s.title === resumeTitle
+        );
+        if (desktopSession) {
+          const key = `claude:${desktopSession.session_id}`;
+          if (!rootPids.has(key)) rootPids.set(key, pid);
+        } else {
+          unmappedClaude.push(pid);
+        }
+      } else {
+        if (isClaudeProc) unmappedClaude.push(pid);
+        else unmappedCodex.push(pid);
+      }
     }
   }
 
@@ -4477,8 +4500,10 @@ function renderSessionRow(session, index, isSelected, width, now, hScroll, state
       }
     } else if (col.key === "active") {
       colColor = ageDimColor(session, now);
-    } else if (col.key === "project" && session.surface === "desktop") {
-      colColor = "\x1b[38;5;141m"; // light purple for desktop sessions
+    } else if (col.key === "project" && session.surface === "desktop-cowork") {
+      colColor = "\x1b[38;5;183m"; // lavender for cowork sessions
+    } else if (col.key === "project" && isDesktopSession(session)) {
+      colColor = "\x1b[38;5;141m"; // purple for code sessions
     } else if (col.key === "model") {
       colColor = modelColor(session);
     } else if (col.key === "cost") {
@@ -4769,7 +4794,7 @@ function renderFooter(state, width) {
 function renderDetailView(session, data, plan, width, height) {
   const lines = [];
 
-  const prov = session.surface === "desktop" ? "Claude Desktop"
+  const prov = session.surface === "desktop-cowork" ? "Claude Cowork" : isDesktopSession(session) ? "Claude Code"
     : session.provider === "claude" ? "Claude" : "Codex";
   lines.push(boxTop(width - 1, `Session Detail — ${prov} ${session.session_id || "unknown"}`));
   lines.push("");
@@ -5061,7 +5086,7 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows, scrollTop, st
   const lines = allLines;
 
   session._copyTargets = [];
-  const prov = session.surface === "desktop" ? "Claude Desktop"
+  const prov = session.surface === "desktop-cowork" ? "Claude Cowork" : isDesktopSession(session) ? "Claude Code"
     : session.provider === "claude" ? "Claude" : "Codex";
   const sid = session.session_id || "unknown";
   const pm = session.process;
@@ -5118,8 +5143,9 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows, scrollTop, st
   // ── Build left and right field sets ──
   const m = safeMetrics(data);
   const displayModel = data.lastModel || session.model || (data.models || [data.model])[0] || "?";
-  const isDesktop = session.surface === "desktop";
-  const provColor = isDesktop ? "\x1b[38;5;141m"
+  const isDesktop = isDesktopSession(session);
+  const provColor = session.surface === "desktop-cowork" ? "\x1b[38;5;183m"  // lavender for cowork
+    : isDesktop ? "\x1b[38;5;141m"                                           // purple for code
     : session.provider === "claude" ? "\x1b[38;5;173m"
     : "\x1b[38;5;110m";
   const ml = displayModel.toLowerCase();
@@ -6309,7 +6335,7 @@ function deleteSession(session) {
     try { rmSync(stem, { recursive: true, force: true }); } catch {}
     // Desktop sessions: also remove the local_<uuid>.json metadata file
     // and the local_<uuid>/ working directory so the session isn't rediscovered.
-    if (session.surface === "desktop" && session._mac_meta) {
+    if (isDesktopSession(session) && session._mac_meta) {
       try { rmSync(session._mac_meta.metaPath); } catch {}
       try { rmSync(session._mac_meta.sessionDir, { recursive: true, force: true }); } catch {}
     }
