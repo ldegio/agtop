@@ -813,8 +813,8 @@ function listClaudeMacSessions() {
         if (!summary.model && !meta.model) continue; // skip empty sessions
         sessions.push({
           provider: "claude",
-          // hostLoopMode=true → local Code session; absent/false → Cowork (VM)
-          surface: meta.hostLoopMode ? "desktop-code" : "desktop-cowork",
+          // vmProcessName present → Cowork (VM); absent → local Code session
+          surface: meta.vmProcessName ? "desktop-cowork" : "desktop-code",
           session_id: cliSessionId,
           started_at: new Date(meta.createdAt).toISOString(),
           last_active: new Date(meta.lastActivityAt || meta.createdAt).toISOString(),
@@ -5519,6 +5519,13 @@ function renderSystemPanel(session, data, panelW, rows) {
     return lines;
   }
 
+  if (session.surface === "desktop-cowork") {
+    lines.push(C.dimText + "Cowork sessions run inside a cloud VM." + RESET);
+    lines.push(C.dimText + "No local process metrics are available." + RESET);
+    while (lines.length < rows) lines.push("");
+    return lines;
+  }
+
   const pm = session.process;
 
   if (!pm) {
@@ -6397,6 +6404,13 @@ function renderProcessesPanel(session, panelW, rows, state) {
   if (session && session._isSubagent) {
     lines.push(C.dimText + "Shared with parent process — no per-subagent OS process list." + RESET);
     lines.push(C.dimText + "Select the parent session row to see its process tree." + RESET);
+    while (lines.length < rows) lines.push("");
+    return lines;
+  }
+
+  if (session && session.surface === "desktop-cowork") {
+    lines.push(C.dimText + "Cowork sessions run inside a cloud VM." + RESET);
+    lines.push(C.dimText + "No local process tree is available." + RESET);
     while (lines.length < rows) lines.push("");
     return lines;
   }
