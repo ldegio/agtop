@@ -8178,6 +8178,15 @@ async function loadSessions(state) {
       // regardless of which panel is currently visible.
       pushHistory(_cpuHistory, key, pm.cpu);
       pushHistory(_memHistory, key, pm.memory / (1024 * 1024));
+    } else if (s.surface === "desktop-cowork") {
+      // Cowork runs in a VM — no local process, but we can infer "running"
+      // from last_active being very recent. Use a minimal sentinel so the
+      // green dot lights up; CPU/memory remain unavailable.
+      const la = s.last_active ? new Date(s.last_active).getTime() : 0;
+      const ageMs = Date.now() - la;
+      s.process = ageMs < 90_000
+        ? { cpu: 0, memory: 0, pids: 0, command: "(cowork VM)", processList: [] }
+        : null;
     } else {
       s.process = null;
     }
