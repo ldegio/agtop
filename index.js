@@ -964,8 +964,18 @@ function extractToolDetail(name, input) {
     const raw = input.input || input.stdin || "";
     s = raw.split(/[\r\n]/)[0].slice(0, 200);
   } else if (typeof input === "object") {
-    for (const v of Object.values(input)) {
-      if (typeof v === "string" && v.length > 0) { s = v.split(/[\r\n]/)[0].slice(0, 120); break; }
+    // For MCP tools, prefer string args that look like meaningful inputs
+    // (skip internal IDs, hashes, and other noise)
+    for (const [k, v] of Object.entries(input)) {
+      if (typeof v !== "string" || v.length === 0) continue;
+      // Skip values that look like git hashes / hex IDs (pure hex 7-40 chars)
+      if (/^[0-9a-f]{7,40}$/i.test(v.trim())) continue;
+      // Prefer keys that suggest user-visible content
+      if (/query|search|message|text|content|prompt|input|command|path|url|topic|channel/i.test(k)) {
+        s = v.split(/[\r\n]/)[0].slice(0, 120);
+        break;
+      }
+      if (!s) s = v.split(/[\r\n]/)[0].slice(0, 120);
     }
   }
   return { short: s, full: s };
@@ -5945,13 +5955,16 @@ function renderAgentPanel(session, data, panelW, rows, state) {
       state._agentCopyTargets.push({ row: r, value: copyValue });
 
       // Tool name prefix for "All" view
-      const entryTool = isAllTab ? (entry._tool || "") : "";
-      const toolLabel = entryTool ? prettyMcpName(entryTool) : "";
+      const entryTool = isAllTab ? (entry._tool || "") : (toolName !== "*All" ? toolName : "");
+      const isMcpEntry = entryTool.startsWith("mcp__") || (!isAllTab && toolName.startsWith("mcp__"));
+      const toolLabel = entryTool && isAllTab ? prettyMcpName(entryTool) : "";
       const toolLabelW = toolLabel ? toolLabel.length + 1 : 0; // +1 trailing space
 
+      const mcpTag = isMcpEntry ? "[mcp] " : "";
+      const mcpTagW = mcpTag.length;
       const tsW = tsLabel ? tsLabel.length + 1 : 0; // +1 for trailing space
       const iconW = 2; // icon char may be double-width in some fonts
-      const availW = contentW - 3 - tsW - toolLabelW - iconW; // space + ts + toolLabel + text + space + icon
+      const availW = contentW - 3 - tsW - toolLabelW - mcpTagW - iconW;
       if (display.length > availW) display = display.slice(0, Math.max(0, availW - 1)) + "…";
       line += " ";
       if (tsLabel) line += C.dimText + tsLabel + RESET + " ";
@@ -5963,6 +5976,7 @@ function renderAgentPanel(session, data, panelW, rows, state) {
         const colorIdx = ((hash % TOOL_COLORS.length) + TOOL_COLORS.length) % TOOL_COLORS.length;
         line += `\x1b[38;5;${TOOL_COLORS[colorIdx]}m` + toolLabel + RESET + " ";
       }
+      if (mcpTag) line += "\x1b[38;5;66m" + mcpTag + RESET; // muted teal tag
       line += C.hdrValue + display + RESET;
       const textLen = display.length;
       const fillLen = Math.max(0, availW - textLen);
