@@ -909,6 +909,31 @@ function emptyMetrics() {
 
 /** Extract display (truncated) and full clipboard strings from a tool invocation's input.
  *  Returns { short, full } where short is for panel display and full is for clipboard. */
+/**
+ * Pretty-print an MCP tool name for display.
+ * "mcp__Claude_in_Chrome__tabs_context_mcp" → "Chrome: tabs context"
+ * "mcp__github__search_code"                → "github: search code"
+ * Non-MCP names pass through unchanged.
+ */
+function prettyMcpName(name) {
+  if (!name || !name.startsWith("mcp__")) return name;
+  // Split into parts: ["", "server", "tool"] (two underscores as separator)
+  const withoutPrefix = name.slice(5); // strip "mcp__"
+  const sepIdx = withoutPrefix.indexOf("__");
+  if (sepIdx === -1) return withoutPrefix.replace(/_/g, " ");
+  const server = withoutPrefix.slice(0, sepIdx);
+  const tool   = withoutPrefix.slice(sepIdx + 2);
+  // Strip "plugin_<name>_<name>" wrapper (e.g. "plugin_slack_slack" → "slack")
+  const serverStripped = server.replace(/^plugin_([^_]+)_\1$/i, "$1");
+  // Clean up server name: strip common suffixes, convert underscores/hyphens to spaces
+  const serverClean = serverStripped.replace(/_mcp$/i, "").replace(/[-_]/g, " ").trim();
+  // Clean up tool name: strip common suffixes and redundant server prefix, convert underscores to spaces
+  const serverWord = serverClean.split(" ")[0].toLowerCase();
+  const toolStripped = tool.replace(new RegExp(`^${serverWord}_`, "i"), "");
+  const toolClean = toolStripped.replace(/_mcp$/i, "").replace(/_/g, " ").trim();
+  return `${serverClean}: ${toolClean}`;
+}
+
 function extractToolDetail(name, input) {
   if (!input) return { short: "", full: "" };
   if (name === "Bash") {
@@ -2945,7 +2970,7 @@ const COL_LAST_TOOL = {
   key: "last_tool", label: "LAST_TOOL", width: 14, align: "left", desc: "Most recently invoked tool",
   render: (s) => {
     const t = s.list_last_tool || "";
-    return t.replace(/^mcp__[^_]+__/, "mcp:");
+    return prettyMcpName(t);
   },
   compare: (a, b) => (a.list_last_tool || "").localeCompare(b.list_last_tool || ""),
 };
@@ -5829,7 +5854,7 @@ function renderAgentPanel(session, data, panelW, rows, state) {
 
       // Format: " Name   42 " (fixed width)
       const isAllEntry = tName === "*All";
-      const shortName = isAllEntry ? "All" : tName.replace(/^mcp__/, "");
+      const shortName = isAllEntry ? "All" : (tName.startsWith("mcp__") ? prettyMcpName(tName) : tName);
       const countStr = String(displayCount);
       const maxNameLen = AGENT_TAB_WIDTH - countStr.length - 3; // space + name + space + count + space
       const trimName = shortName.length > maxNameLen ? shortName.slice(0, maxNameLen - 1) + "…" : shortName;
@@ -5921,7 +5946,7 @@ function renderAgentPanel(session, data, panelW, rows, state) {
 
       // Tool name prefix for "All" view
       const entryTool = isAllTab ? (entry._tool || "") : "";
-      const toolLabel = entryTool ? entryTool.replace(/^mcp__[^_]+__/, "mcp:") : "";
+      const toolLabel = entryTool ? prettyMcpName(entryTool) : "";
       const toolLabelW = toolLabel ? toolLabel.length + 1 : 0; // +1 trailing space
 
       const tsW = tsLabel ? tsLabel.length + 1 : 0; // +1 for trailing space
