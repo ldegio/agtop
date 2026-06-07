@@ -3605,7 +3605,9 @@ async function collectProcessMetrics(sessions) {
     const argv0 = args.split(" ")[0];
     const base = argv0.replace(/.*[/\\]/, "").replace(/\.js$/, "").toLowerCase();
     // Exclude macOS .app bundles (Claude Desktop / Codex Desktop and their helpers)
-    const isAppBundle = /\.app[/\\]/.test(args);
+    // Exclude macOS .app bundles (Claude Desktop, etc.) but allow the Claude Code
+    // binary bundled by Claude for Mac under .../claude-code/.../claude.app/...
+    const isAppBundle = /\.app[/\\]/.test(args) && !/[/\\]claude-code[/\\]/.test(args);
     const isClaudeProc = base === "claude" && !isAppBundle;
     // Node-hosted codex: check that the script argument (not just any path) is "codex"
     let isCodexNode = false;
