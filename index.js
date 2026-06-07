@@ -968,18 +968,30 @@ function extractToolDetail(name, input) {
     const raw = input.input || input.stdin || "";
     s = raw.split(/[\r\n]/)[0].slice(0, 200);
   } else if (typeof input === "object") {
-    // For MCP tools, prefer string args that look like meaningful inputs
-    // (skip internal IDs, hashes, and other noise)
+    // For MCP tools, extract meaningful args across types:
+    //   string → use directly (skip hex IDs)
+    //   array  → join items (e.g. keywords: ["a","b"] → "a, b")
+    //   boolean → skip (flags like createIfEmpty add no display value)
+    //   number → skip
     for (const [k, v] of Object.entries(input)) {
-      if (typeof v !== "string" || v.length === 0) continue;
-      // Skip values that look like git hashes / hex IDs (pure hex 7-40 chars)
-      if (/^[0-9a-f]{7,40}$/i.test(v.trim())) continue;
+      let candidate = "";
+      if (typeof v === "string" && v.length > 0) {
+        if (/^[0-9a-f]{7,40}$/i.test(v.trim())) continue; // skip hex IDs
+        candidate = v.split(/[\r\n]/)[0].slice(0, 120);
+      } else if (Array.isArray(v) && v.length > 0) {
+        // Join array of strings (e.g. keywords, tags)
+        const items = v.filter(x => typeof x === "string").slice(0, 5);
+        if (items.length === 0) continue;
+        candidate = items.join(", ").slice(0, 120);
+      } else {
+        continue;
+      }
       // Prefer keys that suggest user-visible content
-      if (/query|search|message|text|content|prompt|input|command|path|url|topic|channel/i.test(k)) {
-        s = v.split(/[\r\n]/)[0].slice(0, 120);
+      if (/query|search|keyword|message|text|content|prompt|input|command|path|url|topic|channel|name/i.test(k)) {
+        s = candidate;
         break;
       }
-      if (!s) s = v.split(/[\r\n]/)[0].slice(0, 120);
+      if (!s) s = candidate;
     }
   }
   return { short: s, full: s };
@@ -5974,6 +5986,7 @@ function renderAgentPanel(session, data, panelW, rows, state) {
       if (display.length > availW) display = display.slice(0, Math.max(0, availW - 1)) + "…";
       line += " ";
       if (tsLabel) line += C.dimText + tsLabel + RESET + " ";
+      if (mcpTag) line += "\x1b[38;5;66m" + mcpTag + RESET; // muted teal tag — before tool name
       if (toolLabel) {
         // Stable color per tool name (cycle through palette)
         const TOOL_COLORS = [75, 114, 173, 180, 139, 109, 146, 215, 152, 167];
@@ -5982,7 +5995,6 @@ function renderAgentPanel(session, data, panelW, rows, state) {
         const colorIdx = ((hash % TOOL_COLORS.length) + TOOL_COLORS.length) % TOOL_COLORS.length;
         line += `\x1b[38;5;${TOOL_COLORS[colorIdx]}m` + toolLabel + RESET + " ";
       }
-      if (mcpTag) line += "\x1b[38;5;66m" + mcpTag + RESET; // muted teal tag
       line += C.hdrValue + display + RESET;
       const textLen = display.length;
       const fillLen = Math.max(0, availW - textLen);
