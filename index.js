@@ -923,6 +923,10 @@ function prettyMcpName(name) {
   if (sepIdx === -1) return withoutPrefix.replace(/_/g, " ");
   const server = withoutPrefix.slice(0, sepIdx);
   const tool   = withoutPrefix.slice(sepIdx + 2);
+  // If the server part is a UUID (anonymous/dynamic MCP server), just show the action
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(server)) {
+    return tool.replace(/_/g, " ").trim();
+  }
   // Strip "plugin_<name>_<name>" wrapper (e.g. "plugin_slack_slack" → "slack")
   const serverStripped = server.replace(/^plugin_([^_]+)_\1$/i, "$1");
   // Clean up server name: strip common suffixes, convert underscores/hyphens to spaces
@@ -1936,6 +1940,7 @@ async function extractClaudeSessionData(transcriptPath) {
     _subagentCostNumber: true, // cache bust: subagent.cost is now a number (was a money() string)
     _subagentDescPairing: true, // cache bust: on-disk subagents without toolUseId now back-paired by description
     _subagentContext: true,     // cache bust: per-subagent context usage added
+    _prettyMcpDetails: true,   // cache bust: MCP tool detail extraction improved (UUID server names)
   };
 }
 
@@ -2177,7 +2182,8 @@ async function safeExtractSessionData(session) {
   const subagentCostNumber = cache[dKey] && cache[dKey]._subagentCostNumber === true;
   const subagentDescPairing = cache[dKey] && cache[dKey]._subagentDescPairing === true;
   const subagentContext = cache[dKey] && cache[dKey]._subagentContext === true;
-  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay && hasLocalDates && hasNoSubagentModel && hasSubagentsField && hasGhostSubagents && subagentCostNumber && subagentDescPairing && subagentContext) {
+  const prettyMcpDetails = cache[dKey] && cache[dKey]._prettyMcpDetails === true;
+  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay && hasLocalDates && hasNoSubagentModel && hasSubagentsField && hasGhostSubagents && subagentCostNumber && subagentDescPairing && subagentContext && prettyMcpDetails) {
     SESSION_DATA_CACHE.set(memKey, cache[dKey]);
     SESSION_DATA_MTIME.set(memKey, effectiveMtime);
     return cache[dKey];
