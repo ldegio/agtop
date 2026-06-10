@@ -88,6 +88,20 @@ const CODEX_PRICING = {
 };
 
 const CLAUDE_PRICING = {
+  "fable-5": {
+    input_per_million: 10.0,
+    cache_write_5m_per_million: 12.5,
+    cache_write_1h_per_million: 20.0,
+    cache_read_per_million: 1.0,
+    output_per_million: 50.0,
+  },
+  "claude-fable-5": {
+    input_per_million: 10.0,
+    cache_write_5m_per_million: 12.5,
+    cache_write_1h_per_million: 20.0,
+    cache_read_per_million: 1.0,
+    output_per_million: 50.0,
+  },
   "claude-opus-4-8": {
     input_per_million: 5.0,
     cache_write_5m_per_million: 6.25,
@@ -960,7 +974,10 @@ function extractToolDetail(name, input) {
   else if (name === "Glob") s = input.pattern || "";
   else if (name === "WebFetch") s = input.url || "";
   else if (name === "WebSearch") s = input.query || "";
-  else if (name === "ToolSearch") s = input.query || "";
+  else if (name === "ToolSearch") {
+    // Strip mcp__<uuid>__ prefixes that appear inside select:... queries
+    s = (input.query || "").replace(/mcp__[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}__/gi, "");
+  }
   else if (name === "TaskUpdate") s = input.task_id ? `#${input.task_id} ${input.status || ""}`.trim() : "";
   else if (name === "TaskGet" || name === "TaskStop" || name === "TaskOutput") s = input.task_id ? `#${input.task_id}` : "";
   else if (name === "TaskList") s = "(list)";
@@ -2981,7 +2998,13 @@ const COL_TOOLS_RATE = {
 };
 const COL_MODEL = {
   key: "model", label: "MODEL", width: 14, align: "left", desc: "AI model used by the session",
-  render: (s) => (s.model || "").replace(/^claude-/, "").replace(/^gpt-/, ""),
+  render: (s) => {
+    const m = (s.model || "").replace(/^claude-/, "").replace(/^gpt-/, "");
+    if (!_showModelGlyphs) return m;
+    if (s.surface === "desktop-cowork") return "☁ " + m;
+    if (isDesktopSession(s)) return "⌘ " + m;
+    return "❯ " + m;
+  },
   compare: (a, b) => (a.model || "").localeCompare(b.model || ""),
 };
 const COL_IN_TOKENS = {
@@ -4287,6 +4310,7 @@ const _globalTokenDeltaHist = [];
 let _prevSpendTotal = null;
 let _prevTokenTotal = null;
 let _deltaWarmup = 0;
+let _showModelGlyphs = false; // true when the visible list mixes desktop and CLI sessions
 
 function pushGlobalHistory(arr, value) {
   arr.push(value);
@@ -6845,6 +6869,10 @@ function render(state) {
   // so changes to filtered/sorted sessions or expansion state are picked up.
   state.flatList = buildFlatList(state);
   const flat = state.flatList;
+  // Show model glyphs only when there's a mix of desktop and CLI sessions
+  const _surfaceTypes = new Set(state.filtered.map(s =>
+    s.surface === "desktop-cowork" ? "cowork" : isDesktopSession(s) ? "code" : "cli"));
+  _showModelGlyphs = _surfaceTypes.size > 1;
 
   // Adjust scroll to keep selection visible
   if (state.selectedRow < state.scrollOffset) {
