@@ -893,11 +893,16 @@ function resolveProviderPlans(plan) {
   throw new SessionCostError(`Unsupported plan mode: ${plan}`);
 }
 
+// Fallback only: older Codex session files can lack a recorded cwd. Never
+// stomp a real label_source — with multiple concurrent Codex sessions across
+// different directories, overriding the most recent one's cwd unconditionally
+// breaks process-to-session cwd matching for that session (surfaces as a
+// phantom "_pid_<pid>" entry instead of the real running session).
 function applyCurrentDirectoryOverride(sessions) {
   if (!sessions.length) return;
   const cwd = process.cwd();
   for (const s of sessions) {
-    if (s.provider === "codex") {
+    if (s.provider === "codex" && !s.label_source) {
       s.label_source = cwd;
       break;
     }
@@ -3409,8 +3414,11 @@ function bfsDescendants(rootPid, childrenByPpid) {
 
 // Extract session UUID from Claude/Codex command line args.
 const RESUME_UUID_RE = /\bresume\s+([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})/;
-// Claude for Mac launches sessions as: claude --resume <title>  (title, not UUID)
-const RESUME_TITLE_RE = /\bresume\s+(.+)$/;
+// Claude for Mac launches sessions as: claude --resume <title>  (title, not UUID).
+// The CLI accepts the same form for fuzzy title matching, so a title here does not
+// imply a desktop process. Stop at the next flag so trailing options (e.g.
+// "--resume mac agent --dangerously-skip-permissions") don't end up in the title.
+const RESUME_TITLE_RE = /\bresume[\s=]+(.+?)(?=\s+-|$)/;
 
 /** True for any Claude for Mac session (Code or Cowork). */
 function isDesktopSession(session) {
@@ -3675,6 +3683,12 @@ async function collectProcessMetrics(sessions) {
   const unmappedClaude = []; // PIDs where Claude process found but no --resume UUID
   const unmappedCodex = [];
 
+  // First pass: classify every process as a Claude/Codex CLI process or not.
+  // A CLI invocation is often a wrapper script (e.g. `node .../bin/codex`) that
+  // spawns the real binary as a child — both would otherwise be treated as
+  // independent candidates and race for the same session (one loses and gets
+  // reported as a phantom "no session file" process).
+  const cliClassification = new Map(); // pid → { isClaudeProc, isCodexProc, args }
   for (const [pid, info] of snapshot) {
     const args = info.args || "";
     // Extract basename of argv[0] — reliable regardless of install path.
@@ -3699,6 +3713,20 @@ async function collectProcessMetrics(sessions) {
     const isCodexProc = (base === "codex" && !isAppBundle) || isCodexNode;
     if (!isClaudeProc && !isCodexProc) continue;
     if (DAEMON_RE.test(args)) continue; // skip background daemons (e.g. codex app-server)
+    cliClassification.set(pid, { isClaudeProc, isCodexProc, args });
+  }
+
+  for (const [pid, { isClaudeProc, isCodexProc, args }] of cliClassification) {
+    // Skip PIDs that are descendants of another Claude/Codex CLI process — the
+    // ancestor is the real root candidate and already covers this pid via
+    // bfsDescendants once matched.
+    let ancestorPpid = snapshot.get(pid)?.ppid;
+    let isChildOfCli = false;
+    while (ancestorPpid && snapshot.has(ancestorPpid)) {
+      if (cliClassification.has(ancestorPpid)) { isChildOfCli = true; break; }
+      ancestorPpid = snapshot.get(ancestorPpid).ppid;
+    }
+    if (isChildOfCli) continue;
 
     const resumeMatch = args.match(RESUME_UUID_RE);
     if (resumeMatch) {
@@ -3709,18 +3737,17 @@ async function collectProcessMetrics(sessions) {
     } else {
       // Try title-based match for Claude for Mac sessions (claude --resume <title>)
       const titleMatch = isClaudeProc && args.match(RESUME_TITLE_RE);
-      if (titleMatch) {
-        const resumeTitle = titleMatch[1].trim();
-        const desktopSession = sessions.find(
-          s => isDesktopSession(s) && s.title && s.title === resumeTitle
-        );
-        if (desktopSession) {
-          const key = `claude:${desktopSession.session_id}`;
-          if (!rootPids.has(key)) rootPids.set(key, pid);
-        } else {
-          unmappedClaude.push(pid);
-        }
+      const resumeTitle = titleMatch ? titleMatch[1].trim() : null;
+      const desktopSession = resumeTitle && sessions.find(
+        s => isDesktopSession(s) && s.title && s.title === resumeTitle
+      );
+      if (desktopSession) {
+        const key = `claude:${desktopSession.session_id}`;
+        if (!rootPids.has(key)) rootPids.set(key, pid);
       } else {
+        // No title, or a title that matches no desktop session: the CLI accepts
+        // `--resume <text>` for fuzzy title matching too, so fall through to the
+        // lsof/cwd fallback rather than dropping the PID.
         if (isClaudeProc) unmappedClaude.push(pid);
         else unmappedCodex.push(pid);
       }
@@ -3747,14 +3774,18 @@ async function collectProcessMetrics(sessions) {
       }
     }
 
-    // Build cwd→session lookup for cwd-based matching (prefer most recent)
-    const cwdToSession = new Map();
+    // Build cwd→sessions lookup for cwd-based matching, most recent first. A
+    // directory can hold several sessions (and several live processes), so keep
+    // the whole list: each PID claims the newest candidate not already taken.
+    const cwdToSessions = new Map();
     for (const s of sessions) {
       if (!s.label_source) continue;
-      const existing = cwdToSession.get(s.label_source);
-      if (!existing || (s.last_active && (!existing.last_active || s.last_active > existing.last_active))) {
-        cwdToSession.set(s.label_source, s);
-      }
+      const list = cwdToSessions.get(s.label_source);
+      if (list) list.push(s);
+      else cwdToSessions.set(s.label_source, [s]);
+    }
+    for (const list of cwdToSessions.values()) {
+      list.sort((a, b) => (b.last_active || "").localeCompare(a.last_active || ""));
     }
 
     for (const { pid, provider } of unmapped) {
@@ -3764,11 +3795,20 @@ async function collectProcessMetrics(sessions) {
         const key = `${provider}:${cached.uuid}`;
         if (!rootPids.has(key)) rootPids.set(key, pid);
       } else if (cached.cwd) {
-        // cwd-based fallback: find most recent session matching this working directory
-        const session = cwdToSession.get(cached.cwd);
-        if (session) {
-          const key = `${session.provider}:${session.session_id}`;
-          if (!rootPids.has(key)) rootPids.set(key, pid);
+        // cwd-based fallback: newest same-provider session in this working
+        // directory that no other PID has claimed yet (skipping sessions
+        // already matched by UUID keeps two CLIs in one directory distinct).
+        const candidates = cwdToSessions.get(cached.cwd) || [];
+        let key = null;
+        for (const s of candidates) {
+          if (s.provider !== provider) continue;
+          const candidateKey = `${s.provider}:${s.session_id}`;
+          if (rootPids.has(candidateKey)) continue;
+          key = candidateKey;
+          break;
+        }
+        if (key) {
+          rootPids.set(key, pid);
         } else {
           // Truly orphan: running process with no session file yet
           const syntheticKey = `${provider}:_pid_${pid}`;
