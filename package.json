@@ -1,6 +1,6 @@
 {
   "name": "@ldegio/agtop",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "htop-like TUI for monitoring AI coding agent sessions (Claude Code, Codex)",
   "type": "module",
   "bin": {
