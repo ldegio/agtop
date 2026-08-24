@@ -3860,6 +3860,12 @@ async function collectProcessMetrics(sessions) {
     });
   }
 
+  // Evict lsof cache entries for pids that no longer exist — otherwise this
+  // grows for the life of the process, one entry per pid ever seen.
+  for (const pid of _lsofCache.keys()) {
+    if (!snapshot.has(pid)) _lsofCache.delete(pid);
+  }
+
   return result;
 }
 
@@ -8285,6 +8291,50 @@ function tuiShutdown() {
 // Session loading
 // ---------------------------------------------------------------------------
 
+// Evict cache entries for sessions/files no longer present on disk. Several
+// module-level caches (SESSION_DATA_CACHE, per-session history/rate maps,
+// static-field caches) are keyed by session or file path and never shrink on
+// their own — in a long-running process, each is a candidate to accumulate
+// one entry per session ever observed across the process's uptime, including
+// sessions later deleted (e.g. by a CLI's own history retention), rather than
+// tracking just what's currently on disk. Safe to call every refresh tick:
+// it only removes keys absent from the current session list.
+function pruneSessionCaches(sessions, contextCache) {
+  const sessionKeys = new Set();
+  const dataFileKeys = new Set();
+  const filePaths = new Set();
+  for (const s of sessions) {
+    sessionKeys.add(`${s.provider}:${s.session_id}`);
+    if (s.data_file) {
+      dataFileKeys.add(`${s.provider}:${s.data_file}`);
+      filePaths.add(s.data_file);
+    }
+  }
+  for (const key of SESSION_DATA_CACHE.keys()) {
+    if (!dataFileKeys.has(key)) {
+      SESSION_DATA_CACHE.delete(key);
+      SESSION_DATA_MTIME.delete(key);
+    }
+  }
+  for (const key of _codexStaticCache.keys()) {
+    if (!filePaths.has(key)) _codexStaticCache.delete(key);
+  }
+  for (const key of _sessionStaticCache.keys()) {
+    if (!filePaths.has(key)) _sessionStaticCache.delete(key);
+  }
+  for (const map of [_cpuHistory, _memHistory, _rateState, _procGhostCache]) {
+    for (const key of map.keys()) {
+      if (!sessionKeys.has(key)) map.delete(key);
+    }
+  }
+  if (contextCache) {
+    for (const key of contextCache.keys()) {
+      if (!sessionKeys.has(key)) contextCache.delete(key);
+    }
+  }
+  pruneDiskCache();
+}
+
 async function loadSessions(state) {
   const [codexSessions, claudeSessions] = listAllSessions();
   applyCurrentDirectoryOverride(codexSessions);
@@ -8389,6 +8439,7 @@ async function loadSessions(state) {
   }
 
   updateSessionRates(state.sessions);
+  pruneSessionCaches(state.sessions, state._contextCache);
   applySortAndFilter(state);
   state.stats = computeStats(state.sessions);
   updateOverviewHistory(state.stats);
