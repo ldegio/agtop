@@ -701,6 +701,14 @@ function fileMtime(filePath) {
 // These are set in the first few lines and never change, so we only read once.
 const _sessionStaticCache = new Map(); // transcriptPath → { model, cwd, startedAt }
 
+// Cache for the custom-title tail scan, keyed by the main file's own mtime.
+// A /rename only ever appends a "custom-title" record to the MAIN transcript
+// file, so if that file's mtime hasn't moved since we last scanned it, the
+// title cannot have changed — skip the (relatively costly, chunked-from-EOF)
+// re-read. This was ~40% of listClaudeSessions()'s per-tick cost across a
+// few dozen mostly-dormant sessions, run unconditionally every refresh tick.
+const _customTitleCache = new Map(); // transcriptPath → { mtimeMs, customTitle }
+
 function collectClaudeSessionSummary(transcriptPath) {
   // Static fields that genuinely never change: model, cwd, startedAt.
   let staticParts = _sessionStaticCache.get(transcriptPath);
@@ -722,21 +730,30 @@ function collectClaudeSessionSummary(transcriptPath) {
     staticParts = { model, cwd, startedAt: formatTimestampForSession(earliest), aiTitle: aiTitleFromHead };
     if (model) _sessionStaticCache.set(transcriptPath, staticParts); // only cache once we have a model
   }
-  // custom-title (via /rename) is usually set late in a session, so scan the
-  // last lines on every call. Cheap: reads chunks backwards from EOF.
-  let customTitle = null;
-  for (const item of readLastLines(transcriptPath, 200)) {
-    if (item.type === "custom-title" && typeof item.customTitle === "string") {
-      customTitle = item.customTitle;
-      break;
-    }
-  }
 
   // Dynamic field: lastActive is just mtime — cheap stat, no file read.
   let latest = fileMtime(transcriptPath);
   for (const filePath of claudeTranscriptFiles(transcriptPath).slice(1)) {
     const mt = fileMtime(filePath);
     if (mt && (!latest || mt > latest)) latest = mt;
+  }
+
+  // custom-title (via /rename) is usually set late in a session. Only re-scan
+  // the tail when the main file's mtime has actually moved since last check.
+  const mtimeMs = latest ? latest.getTime() : 0;
+  const cachedTitle = _customTitleCache.get(transcriptPath);
+  let customTitle;
+  if (cachedTitle && cachedTitle.mtimeMs === mtimeMs) {
+    customTitle = cachedTitle.customTitle;
+  } else {
+    customTitle = null;
+    for (const item of readLastLines(transcriptPath, 200)) {
+      if (item.type === "custom-title" && typeof item.customTitle === "string") {
+        customTitle = item.customTitle;
+        break;
+      }
+    }
+    _customTitleCache.set(transcriptPath, { mtimeMs, customTitle });
   }
 
   return {
@@ -1868,14 +1885,15 @@ async function extractClaudeSessionData(transcriptPath) {
     // Per-subagent context usage: total of the latest assistant message, against
     // the model's max input window. Subagents have their own isolated contexts
     // independent of the parent, so we compute from the subagent's own usage.
-    // Use usage-based inference for the max (same fallback the parent uses when
-    // no project settings are pinned) — LiteLLM reports 1M for any model that
-    // *can* do 1M with the [1m] beta header, which over-estimates the window
-    // for the common 200k-default case and made some subagents show single-digit
-    // CTX% next to their parent's normal 25-50% reading on the same usage.
+    // Prefer LiteLLM's per-model max (authoritative — e.g. Claude 5 models
+    // default to a 1M window with no opt-in needed), falling back to
+    // usage-based inference only when LiteLLM has no data for the model.
     let context = null;
     if (stats.latest_used > 0) {
-      const maxCtx = stats.latest_used > 200000 ? 1_048_576 : 200000;
+      const litellmEntry = findLitellmEntry(model, _litellmPricing);
+      const maxCtx = (litellmEntry && litellmEntry.max_input_tokens)
+        ? litellmEntry.max_input_tokens
+        : stats.latest_used > 200000 ? 1_048_576 : 200000;
       context = { used: stats.latest_used, max: maxCtx };
     }
 
@@ -1975,6 +1993,7 @@ async function extractClaudeSessionData(transcriptPath) {
     _subagentDescPairing: true, // cache bust: on-disk subagents without toolUseId now back-paired by description
     _subagentContext: true,     // cache bust: per-subagent context usage added
     _prettyMcpDetails: true,   // cache bust: MCP tool detail extraction improved (UUID server names)
+    _pricingRefresh2026_09: true, // cache bust: models priced $0 before LiteLLM had their rates (e.g. claude-fable-5-1) need a one-time recompute now that pricing exists
   };
 }
 
@@ -2217,7 +2236,8 @@ async function safeExtractSessionData(session) {
   const subagentDescPairing = cache[dKey] && cache[dKey]._subagentDescPairing === true;
   const subagentContext = cache[dKey] && cache[dKey]._subagentContext === true;
   const prettyMcpDetails = cache[dKey] && cache[dKey]._prettyMcpDetails === true;
-  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay && hasLocalDates && hasNoSubagentModel && hasSubagentsField && hasGhostSubagents && subagentCostNumber && subagentDescPairing && subagentContext && prettyMcpDetails) {
+  const pricingRefreshed = cache[dKey] && cache[dKey]._pricingRefresh2026_09 === true;
+  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay && hasLocalDates && hasNoSubagentModel && hasSubagentsField && hasGhostSubagents && subagentCostNumber && subagentDescPairing && subagentContext && prettyMcpDetails && pricingRefreshed) {
     SESSION_DATA_CACHE.set(memKey, cache[dKey]);
     SESSION_DATA_MTIME.set(memKey, effectiveMtime);
     return cache[dKey];
@@ -2422,8 +2442,13 @@ function extractContextUsage(session) {
       for (const sf of settingsFiles) {
         try {
           const s = JSON.parse(readFileSync(sf, "utf-8"));
-          if (s.model && typeof s.model === "string") {
-            settingsCtx = s.model.includes("[1m]") ? CLAUDE_1M_CTX : CLAUDE_DEFAULT_CTX;
+          if (s.model && typeof s.model === "string" && s.model.includes("[1m]")) {
+            // Only an explicit "[1m]" opt-in tells us anything definitive here.
+            // A plain model alias (e.g. "sonnet") does NOT imply the legacy
+            // 200k tier — Claude 5 models default to a 1M window with no
+            // suffix needed, so leave settingsCtx unset and let the
+            // per-model LiteLLM max (below) or usage-based inference decide.
+            settingsCtx = CLAUDE_1M_CTX;
             break; // most specific setting wins
           }
         } catch { /* file missing or invalid */ }
@@ -2449,10 +2474,13 @@ function extractContextUsage(session) {
               (u.cache_creation_input_tokens || 0) +
               (u.cache_read_input_tokens || 0);
             if (used > 0) {
-              // Resolution order: settings [1m] > usage inference > LiteLLM > default
+              // Resolution order: settings [1m] > LiteLLM (per-model, authoritative)
+              // > usage inference > default. LiteLLM ranks above usage inference
+              // because it reflects the model's real window (e.g. Claude 5 models
+              // default to 1M) rather than guessing from how much has been used so far.
               const maxCtx = settingsCtx > 0 ? settingsCtx
-                : used > CLAUDE_DEFAULT_CTX ? CLAUDE_1M_CTX
-                : litellmCtx > 0 ? litellmCtx : CLAUDE_DEFAULT_CTX;
+                : litellmCtx > 0 ? litellmCtx
+                : used > CLAUDE_DEFAULT_CTX ? CLAUDE_1M_CTX : CLAUDE_DEFAULT_CTX;
               return { used, max: maxCtx, percent: Math.round((used / maxCtx) * 100),
                 compacting: sawCompactBoundary };
             }
@@ -3329,7 +3357,11 @@ async function fetchQuota() {
 // Tier 2: OS process metrics (posix backend)
 // ---------------------------------------------------------------------------
 
-const TIER2_INTERVAL_TICKS = 1; // collect every loadSessions tick
+// Spawns `ps` (and lsof for unmapped pids) to snapshot every OS process —
+// on a machine with 1000+ processes this alone costs tens of ms. Running it
+// every tick is unnecessary for a monitoring TUI; every 3rd tick keeps CPU/mem
+// readings responsive (~6s at the default 2s delay) while cutting the cost.
+const TIER2_INTERVAL_TICKS = 3;
 const LSOF_CHUNK_SIZE = 50;
 const PID_TREE_TTL_MS = 15_000; // cache subtree PIDs for 15s
 const PROC_LINGER_TICKS = 3; // keep exited sub-processes visible for N collection cycles
@@ -3364,6 +3396,16 @@ function pidusage(pids) {
 }
 
 // Run a single ps to get a full snapshot of all processes.
+//
+// NOTE: tried splitting this into a cheap `comm=`-only scan plus a targeted
+// follow-up `ps -o args=` for just the Claude/Codex candidates, on the theory
+// that skipping full command lines for ~1000 irrelevant processes (some with
+// multi-KB argv from Chrome/Electron --enable-features flags) would be
+// faster. Measured: it wasn't — `ps`'s cost here is dominated by gathering
+// per-process info for 1000+ processes (syscall-bound), not by how many
+// output columns are requested, so the extra `ps` subprocess spawn(s) for
+// the follow-up fetch cost more than the smaller payload saved (~140ms vs
+// ~60ms for collectProcessMetrics as a whole). Keep it as one call.
 function psSnapshot() {
   const isDarwin = process.platform === "darwin";
   const args = isDarwin
@@ -3412,8 +3454,10 @@ function bfsDescendants(rootPid, childrenByPpid) {
   return result;
 }
 
-// Extract session UUID from Claude/Codex command line args.
-const RESUME_UUID_RE = /\bresume\s+([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})/;
+// Extract session UUID from Claude/Codex command line args. Accepts both
+// `--resume <uuid>` (space, CLI form) and `--resume=<uuid>` (equals sign —
+// how Claude for Mac's Code surface launches the underlying CLI process).
+const RESUME_UUID_RE = /\bresume[\s=]+([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})/;
 // Claude for Mac launches sessions as: claude --resume <title>  (title, not UUID).
 // The CLI accepts the same form for fuzzy title matching, so a title here does not
 // imply a desktop process. Stop at the next flag so trailing options (e.g.
@@ -3691,9 +3735,17 @@ async function collectProcessMetrics(sessions) {
   const cliClassification = new Map(); // pid → { isClaudeProc, isCodexProc, args }
   for (const [pid, info] of snapshot) {
     const args = info.args || "";
-    // Extract basename of argv[0] — reliable regardless of install path.
-    const argv0 = args.split(" ")[0];
-    const base = argv0.replace(/.*[/\\]/, "").replace(/\.js$/, "").toLowerCase();
+    // Find "claude"/"codex"/"node" as a complete path segment (preceded by
+    // "/" or start-of-string, followed by whitespace or end-of-string)
+    // rather than naively splitting on the first space. ps's `args=` has no
+    // quoting, and install paths routinely contain spaces themselves (e.g.
+    // macOS's "Application Support", as in Claude for Mac's bundled CLI
+    // path) — `args.split(" ")[0]` truncates argv0 mid-path on those and
+    // silently misses the process entirely. Matching a known executable
+    // name directly sidesteps the ambiguity instead of guessing where
+    // argv0 ends.
+    const execMatch = args.match(/(?:^|[/\\])(claude|codex|node)(?:\.js)?(?=\s|$)/i);
+    const base = execMatch ? execMatch[1].toLowerCase() : "";
     // Exclude macOS .app bundles (Claude Desktop / Codex Desktop and their helpers)
     // Exclude macOS .app bundles (Claude Desktop, etc.) but allow the Claude Code
     // binary bundled by Claude for Mac under .../claude-code/.../claude.app/...
@@ -3858,6 +3910,12 @@ async function collectProcessMetrics(sessions) {
       command: rootInfo ? rootInfo.args : "",
       processList,
     });
+  }
+
+  // Evict lsof cache entries for pids that no longer exist — otherwise this
+  // grows for the life of the process, one entry per pid ever seen.
+  for (const pid of _lsofCache.keys()) {
+    if (!snapshot.has(pid)) _lsofCache.delete(pid);
   }
 
   return result;
@@ -8285,6 +8343,53 @@ function tuiShutdown() {
 // Session loading
 // ---------------------------------------------------------------------------
 
+// Evict cache entries for sessions/files no longer present on disk. Several
+// module-level caches (SESSION_DATA_CACHE, per-session history/rate maps,
+// static-field caches) are keyed by session or file path and never shrink on
+// their own — in a long-running process, each is a candidate to accumulate
+// one entry per session ever observed across the process's uptime, including
+// sessions later deleted (e.g. by a CLI's own history retention), rather than
+// tracking just what's currently on disk. Safe to call every refresh tick:
+// it only removes keys absent from the current session list.
+function pruneSessionCaches(sessions, contextCache) {
+  const sessionKeys = new Set();
+  const dataFileKeys = new Set();
+  const filePaths = new Set();
+  for (const s of sessions) {
+    sessionKeys.add(`${s.provider}:${s.session_id}`);
+    if (s.data_file) {
+      dataFileKeys.add(`${s.provider}:${s.data_file}`);
+      filePaths.add(s.data_file);
+    }
+  }
+  for (const key of SESSION_DATA_CACHE.keys()) {
+    if (!dataFileKeys.has(key)) {
+      SESSION_DATA_CACHE.delete(key);
+      SESSION_DATA_MTIME.delete(key);
+    }
+  }
+  for (const key of _codexStaticCache.keys()) {
+    if (!filePaths.has(key)) _codexStaticCache.delete(key);
+  }
+  for (const key of _sessionStaticCache.keys()) {
+    if (!filePaths.has(key)) _sessionStaticCache.delete(key);
+  }
+  for (const key of _customTitleCache.keys()) {
+    if (!filePaths.has(key)) _customTitleCache.delete(key);
+  }
+  for (const map of [_cpuHistory, _memHistory, _rateState, _procGhostCache]) {
+    for (const key of map.keys()) {
+      if (!sessionKeys.has(key)) map.delete(key);
+    }
+  }
+  if (contextCache) {
+    for (const key of contextCache.keys()) {
+      if (!sessionKeys.has(key)) contextCache.delete(key);
+    }
+  }
+  pruneDiskCache();
+}
+
 async function loadSessions(state) {
   const [codexSessions, claudeSessions] = listAllSessions();
   applyCurrentDirectoryOverride(codexSessions);
@@ -8389,6 +8494,7 @@ async function loadSessions(state) {
   }
 
   updateSessionRates(state.sessions);
+  pruneSessionCaches(state.sessions, state._contextCache);
   applySortAndFilter(state);
   state.stats = computeStats(state.sessions);
   updateOverviewHistory(state.stats);
