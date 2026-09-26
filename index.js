@@ -539,7 +539,35 @@ function abbreviatePaths(values) {
 // ---------------------------------------------------------------------------
 
 // Cache for static Codex session metadata (id, startedAt, model, cwd).
-const _codexStaticCache = new Map(); // filePath → { sessionId, startedAt, model, cwd }
+const _codexStaticCache = new Map(); // filePath → { sessionId, startedAt, model, cwd, parentThreadId }
+
+// Codex Desktop's UI thread names live in ~/.codex/session_index.jsonl, not
+// in the rollout file itself — an append-only log of {id, thread_name}
+// updates, latest occurrence per id wins. Without this, agtop only has the
+// raw cwd to show, even after the user has renamed the thread.
+const CODEX_SESSION_INDEX_FILE = join(HOME, ".codex", "session_index.jsonl");
+let _codexThreadNames = null; // sessionId → thread_name
+let _codexThreadNamesMtimeMs = 0;
+
+function loadCodexThreadNames() {
+  const mtimeMs = fileMtimeMs(CODEX_SESSION_INDEX_FILE);
+  if (_codexThreadNames && mtimeMs === _codexThreadNamesMtimeMs) return _codexThreadNames;
+  const map = new Map();
+  try {
+    const lines = readFileSync(CODEX_SESSION_INDEX_FILE, "utf-8").split("\n");
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const item = JSON.parse(trimmed);
+        if (item.id && typeof item.thread_name === "string") map.set(item.id, item.thread_name);
+      } catch { /* skip malformed line */ }
+    }
+  } catch { /* no index file yet */ }
+  _codexThreadNames = map;
+  _codexThreadNamesMtimeMs = mtimeMs;
+  return map;
+}
 
 function summarizeCodexSession(filePath) {
   // Static fields: read once and cache forever.
@@ -549,6 +577,7 @@ function summarizeCodexSession(filePath) {
     let startedAt = null;
     let model = null;
     let cwd = null;
+    let parentThreadId = null;
 
     const m = UUID_RE.exec(basename(filePath, ".jsonl"));
     if (m) sessionId = m[1];
@@ -560,18 +589,23 @@ function summarizeCodexSession(filePath) {
         sessionId = payload.id || sessionId;
         startedAt = payload.timestamp || item.timestamp || startedAt;
         cwd = payload.cwd || cwd;
+        parentThreadId = payload.parent_thread_id || parentThreadId;
       } else if (type === "turn_context") {
         model = payload.model || model;
       }
       if (sessionId && startedAt && model && cwd) break;
     }
-    staticParts = { sessionId, startedAt, model, cwd };
-    if (sessionId) _codexStaticCache.set(filePath, staticParts);
+    staticParts = { sessionId, startedAt, model, cwd, parentThreadId };
+    // Only cache once the model is known: a just-created session has
+    // session_meta but no turn_context yet, and caching then would pin
+    // model=null for the rest of this process's life.
+    if (sessionId && model) _codexStaticCache.set(filePath, staticParts);
   }
 
   // Dynamic field: lastActive from mtime — cheap stat, no file read.
   const mt = fileMtime(filePath);
   const lastActive = mt ? mt.toISOString() : staticParts.startedAt;
+  const title = staticParts.sessionId ? loadCodexThreadNames().get(staticParts.sessionId) || null : null;
 
   return {
     provider: "codex",
@@ -581,21 +615,46 @@ function summarizeCodexSession(filePath) {
     model: staticParts.model,
     label_source: staticParts.cwd,
     data_file: filePath,
+    title,
+    _parentThreadId: staticParts.parentThreadId,
   };
 }
 
 function listCodexSessions() {
   if (!dirExists(CODEX_SESSIONS_ROOT)) return [];
-  const sessions = [];
+  const all = [];
   for (const filePath of rglob(CODEX_SESSIONS_ROOT).sort().reverse()) {
     try {
-      sessions.push(summarizeCodexSession(filePath));
+      all.push(summarizeCodexSession(filePath));
     } catch (err) {
       if (err instanceof SessionCostError) continue;
       throw err;
     }
   }
-  return sessions;
+
+  // Fold child threads (e.g. Codex's auto-review sub-thread, linked back via
+  // session_meta's parent_thread_id) into their parent instead of listing
+  // them as their own confusing top-level session — their tokens/cost still
+  // count, via _childFiles passed into extractCodexSessionData. Only fold a
+  // child in when its parent is actually present in this listing; otherwise
+  // keep it standalone so its cost doesn't silently disappear.
+  const idSet = new Set(all.map(s => s.session_id));
+  const childFilesByParent = new Map(); // parentSessionId → [filePath, ...]
+  const roots = [];
+  for (const s of all) {
+    if (s._parentThreadId && s._parentThreadId !== s.session_id && idSet.has(s._parentThreadId)) {
+      const list = childFilesByParent.get(s._parentThreadId);
+      if (list) list.push(s.data_file);
+      else childFilesByParent.set(s._parentThreadId, [s.data_file]);
+    } else {
+      roots.push(s);
+    }
+  }
+  for (const s of roots) {
+    const children = childFilesByParent.get(s.session_id);
+    if (children) s._childFiles = children;
+  }
+  return roots;
 }
 
 // ---------------------------------------------------------------------------
@@ -1389,7 +1448,7 @@ function resolveCodexPricing(model) {
   };
 }
 
-async function extractCodexSessionData(sessionFile) {
+async function extractCodexSessionData(sessionFile, childFiles) {
   let model = null;
   const totals = {
     input_tokens: 0,
@@ -1405,9 +1464,17 @@ async function extractCodexSessionData(sessionFile) {
   const seenCallIds = new Set();
   const seenQueries = new Set();
 
-  await forEachJsonl(sessionFile, (item) => {
+  // Child threads (e.g. Codex's auto-review sub-thread) are separate rollout
+  // files linked back via session_meta's parent_thread_id. Their usage/cost
+  // and tool activity get folded into the parent's totals below — but only
+  // the main file's turn_context sets `model`, since a child thread's model
+  // field can be an internal synthetic label (e.g. "codex-auto-review")
+  // rather than a real billable model name.
+  const filesToScan = [{ path: sessionFile, isMain: true }, ...(childFiles || []).map(path => ({ path, isMain: false }))];
+  for (const { path, isMain } of filesToScan) {
+  await forEachJsonl(path, (item) => {
     if (item.type === "turn_context") {
-      model = (item.payload || {}).model || model;
+      if (isMain) model = (item.payload || {}).model || model;
     } else if (item.type === "event_msg") {
       const payload = item.payload || {};
       if (payload.type === "token_count") {
@@ -1476,6 +1543,7 @@ async function extractCodexSessionData(sessionFile) {
       }
     }
   });
+  }
 
   if (!sawLastUsage)
     return {
@@ -2194,12 +2262,14 @@ async function safeExtractSessionData(session) {
   }
   const memKey = `${session.provider}:${session.data_file}`;
 
-  // For Claude sessions, check max mtime across ALL transcript files
-  // (main + subagent files) so cache invalidates when subagents are active.
+  // Check max mtime across ALL related files (Claude: main + subagent files;
+  // Codex: main + child-thread files like an auto-review sub-thread) so the
+  // cache invalidates when any of them are active, not just the main file.
   const effectiveMtime = session.provider === "claude"
     ? claudeTranscriptFiles(session.data_file).reduce(
         (mx, f) => Math.max(mx, fileMtimeMs(f)), 0)
-    : fileMtimeMs(session.data_file);
+    : (session._childFiles || []).reduce(
+        (mx, f) => Math.max(mx, fileMtimeMs(f)), fileMtimeMs(session.data_file));
 
   // Check in-memory cache, but verify mtime hasn't changed.
   if (SESSION_DATA_CACHE.has(memKey)) {
@@ -2246,7 +2316,7 @@ async function safeExtractSessionData(session) {
   try {
     let data = null;
     if (session.provider === "codex") {
-      data = await extractCodexSessionData(session.data_file);
+      data = await extractCodexSessionData(session.data_file, session._childFiles);
     } else if (session.provider === "claude") {
       data = await extractClaudeSessionData(session.data_file);
     }
