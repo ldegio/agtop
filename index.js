@@ -273,7 +273,8 @@ KEYBOARD SHORTCUTS (interactive mode)
   j/k, arrows            Navigate sessions
   Enter                  Open detail view
   Tab                    Cycle bottom panel tabs (Info/Performance/Processes/Tool/Subagents/Cost/Config)
-  \`                      Toggle Sessions/Live Sessions list view
+  \`                      Cycle Sessions / Live / Cost views
+  t                      Cost view: change time range
   1-7                    Jump to Info/Performance/Processes/Tool Activity/Subagents/Cost/Config panel
   F3 or /                Filter sessions by text
   F6 or >                Sort-by panel
@@ -578,6 +579,7 @@ function summarizeCodexSession(filePath) {
     let model = null;
     let cwd = null;
     let parentThreadId = null;
+    let originator = null;
 
     const m = UUID_RE.exec(basename(filePath, ".jsonl"));
     if (m) sessionId = m[1];
@@ -590,12 +592,13 @@ function summarizeCodexSession(filePath) {
         startedAt = payload.timestamp || item.timestamp || startedAt;
         cwd = payload.cwd || cwd;
         parentThreadId = payload.parent_thread_id || parentThreadId;
+        originator = payload.originator || originator;
       } else if (type === "turn_context") {
         model = payload.model || model;
       }
       if (sessionId && startedAt && model && cwd) break;
     }
-    staticParts = { sessionId, startedAt, model, cwd, parentThreadId };
+    staticParts = { sessionId, startedAt, model, cwd, parentThreadId, originator };
     // Only cache once the model is known: a just-created session has
     // session_meta but no turn_context yet, and caching then would pin
     // model=null for the rest of this process's life.
@@ -617,6 +620,7 @@ function summarizeCodexSession(filePath) {
     data_file: filePath,
     title,
     _parentThreadId: staticParts.parentThreadId,
+    originator: staticParts.originator,
   };
 }
 
@@ -681,30 +685,46 @@ function formatTimestampForSession(d) {
     : null;
 }
 
+// Read and parse the first N non-empty JSONL lines. Reads forward in chunks and
+// stops as soon as N lines are complete — transcripts can be tens of MB, and
+// reading the whole file just for its head made every startup read every
+// session file on disk in full.
 function readFirstLines(filePath, maxLines) {
-  let text;
+  let fd;
   try {
-    text = readFileSync(filePath, "utf-8");
+    fd = openSync(filePath, "r");
   } catch {
     return [];
   }
   const items = [];
-  let start = 0;
-  let count = 0;
-  while (count < maxLines && start < text.length) {
-    const nl = text.indexOf("\n", start);
-    const end = nl === -1 ? text.length : nl;
-    const line = text.substring(start, end).trim();
-    start = end + 1;
-    if (!line) continue;
-    try {
-      items.push(JSON.parse(line));
-    } catch {
-      /* skip malformed */
+  try {
+    const chunkSize = 64 * 1024;
+    let pos = 0;
+    let pending = Buffer.alloc(0);
+    let eof = false;
+    while (items.length < maxLines && !eof) {
+      const chunk = Buffer.alloc(chunkSize);
+      const n = readSync(fd, chunk, 0, chunkSize, pos);
+      if (n <= 0) eof = true;
+      pos += n;
+      pending = Buffer.concat([pending, chunk.subarray(0, n)]);
+      let nl;
+      // Split on newline bytes (safe for UTF-8: 0x0a never occurs inside a multibyte char)
+      while (items.length < maxLines && (nl = pending.indexOf(0x0a)) !== -1) {
+        const line = pending.subarray(0, nl).toString("utf-8").trim();
+        pending = pending.subarray(nl + 1);
+        if (!line) continue;
+        try { items.push(JSON.parse(line)); } catch { items.push(null); /* malformed, still counts */ }
+      }
+      if (eof && pending.length && items.length < maxLines) {
+        const line = pending.toString("utf-8").trim();
+        if (line) { try { items.push(JSON.parse(line)); } catch { /* skip */ } }
+      }
     }
-    count++;
+  } finally {
+    try { closeSync(fd); } catch {}
   }
-  return items;
+  return items.filter(Boolean);
 }
 
 // Read the last N non-empty JSONL lines from a file, parsing each as JSON.
@@ -776,6 +796,7 @@ function collectClaudeSessionSummary(transcriptPath) {
     let earliest = null;
     let model = null;
     let cwd = null;
+    let entrypoint = null;
     for (const item of readFirstLines(transcriptPath, 50)) {
       const parsed = parseTimestamp(item.timestamp);
       if (parsed && (!earliest || parsed < earliest)) earliest = parsed;
@@ -785,8 +806,9 @@ function collectClaudeSessionSummary(transcriptPath) {
         if (candidate && candidate !== "<synthetic>") model = candidate;
       }
       if (item.type === "ai-title" && typeof item.aiTitle === "string") aiTitleFromHead = item.aiTitle;
+      if (!entrypoint && typeof item.entrypoint === "string") entrypoint = item.entrypoint;
     }
-    staticParts = { model, cwd, startedAt: formatTimestampForSession(earliest), aiTitle: aiTitleFromHead };
+    staticParts = { model, cwd, startedAt: formatTimestampForSession(earliest), aiTitle: aiTitleFromHead, entrypoint };
     if (model) _sessionStaticCache.set(transcriptPath, staticParts); // only cache once we have a model
   }
 
@@ -834,6 +856,7 @@ function summarizeClaudeSession(transcriptPath) {
     label_source: summary.cwd,
     data_file: transcriptPath,
     title: summary.customTitle || summary.aiTitle || null,
+    entrypoint: summary.entrypoint || null,
   };
 }
 
@@ -1450,16 +1473,9 @@ function resolveCodexPricing(model) {
 
 async function extractCodexSessionData(sessionFile, childFiles) {
   let model = null;
-  const totals = {
-    input_tokens: 0,
-    cached_input_tokens: 0,
-    output_tokens: 0,
-    reasoning_output_tokens: 0,
-    total_tokens: 0,
-  };
-  let sawLastUsage = false;
-  const costsByDay  = {}; // "YYYY-MM-DD"    (UTC) → { model: float }
-  const costsByHour = {}; // "YYYY-MM-DDTHH" (UTC) → { model: float }
+  // One entry per token_count usage event, attributed to the model active at
+  // that point (sessions can switch models mid-way). Priced per model below.
+  const usageEvents = []; // { m, ts, inp, cachedInp, out, reasoning, total }
   const metrics = emptyMetrics();
   const seenCallIds = new Set();
   const seenQueries = new Set();
@@ -1480,24 +1496,12 @@ async function extractCodexSessionData(sessionFile, childFiles) {
       if (payload.type === "token_count") {
         const lastUsage = (payload.info || {}).last_token_usage || {};
         if (Object.keys(lastUsage).length) {
-          sawLastUsage = true;
-          for (const key of Object.keys(totals)) {
-            totals[key] += parseInt(lastUsage[key] || 0, 10) || 0;
-          }
-          // Track cost by day/hour — finalized after pricing is resolved
-          if (item.timestamp) {
-            const d = new Date(item.timestamp);
-            const dateKey = localDateKey(d);
-            const hourKey = localHourKey(d);
-            const addTo = (bucket, key) => {
-              if (!bucket[key]) bucket[key] = { inp: 0, cachedInp: 0, out: 0 };
-              bucket[key].inp       += parseInt(lastUsage.input_tokens || 0, 10) || 0;
-              bucket[key].cachedInp += parseInt(lastUsage.cached_input_tokens || 0, 10) || 0;
-              bucket[key].out       += parseInt(lastUsage.output_tokens || 0, 10) || 0;
-            };
-            addTo(costsByDay, dateKey);
-            addTo(costsByHour, hourKey);
-          }
+          const n = (k) => parseInt(lastUsage[k] || 0, 10) || 0;
+          usageEvents.push({
+            m: model, ts: item.timestamp || "",
+            inp: n("input_tokens"), cachedInp: n("cached_input_tokens"), out: n("output_tokens"),
+            reasoning: n("reasoning_output_tokens"), total: n("total_tokens"),
+          });
         }
       }
     }
@@ -1545,43 +1549,48 @@ async function extractCodexSessionData(sessionFile, childFiles) {
   });
   }
 
-  if (!sawLastUsage)
+  if (!usageEvents.length)
     return {
       session_id: basename(sessionFile, ".jsonl"), lastModel: model || "", models: model ? [model] : [],
       tokens: { input: 0, output: 0, cache_read: 0, cache_write_5m: 0, cache_write_1h: 0 },
-      costs: { total: "0.00" }, modelBreakdown: [], costsByDay: {}, costsByHour: {},
+      costs: { total: "0.00" }, modelBreakdown: [], costsByDay: {}, costsByHour: {}, usageByHour: {},
       metrics, started_at: null, last_active: null,
     };
 
-  const pricing = resolveCodexPricing(model);
-  const inputTokens = totals.input_tokens;
-  const cachedInputTokens = totals.cached_input_tokens;
-  const uncachedInputTokens = Math.max(0, inputTokens - cachedInputTokens);
-  const outputTokens = totals.output_tokens;
-  const reasoningOutputTokens = totals.reasoning_output_tokens;
-  const totalTokens = totals.total_tokens;
-
-  // Convert raw token buckets to per-model cost dicts now that we have pricing
-  const finalizeRaw = (raw) => {
-    const out = {};
-    for (const [key, t] of Object.entries(raw)) {
-      const uncached = Math.max(0, t.inp - t.cachedInp);
-      out[key] = { [model]: tokenCost(uncached, pricing.input_per_million) +
-        tokenCost(t.cachedInp, pricing.cached_input_per_million) +
-        tokenCost(t.out, pricing.output_per_million) };
+  let inputTokens = 0, cachedInputTokens = 0, outputTokens = 0, reasoningOutputTokens = 0, totalTokens = 0;
+  let inputCost = 0, cachedInputCost = 0, outputCost = 0;
+  const costsByDayFinal = {};
+  const costsByHourFinal = {};
+  const usageByHour = {};
+  const activeMinutes = new Set();
+  const modelsSeen = new Set();
+  const pricingCache = new Map();
+  for (const ev of usageEvents) {
+    // Usage logged before the first turn_context gets the session's model.
+    const m = ev.m || model || "unknown";
+    modelsSeen.add(m);
+    if (!pricingCache.has(m)) pricingCache.set(m, resolveCodexPricing(m));
+    const p = pricingCache.get(m);
+    const uncached = Math.max(0, ev.inp - ev.cachedInp);
+    const cIn = tokenCost(uncached, p.input_per_million);
+    const cCached = tokenCost(ev.cachedInp, p.cached_input_per_million);
+    const cOut = tokenCost(ev.out, p.output_per_million);
+    const callCost = cIn + cCached + cOut;
+    inputTokens += ev.inp; cachedInputTokens += ev.cachedInp; outputTokens += ev.out;
+    reasoningOutputTokens += ev.reasoning; totalTokens += ev.total;
+    inputCost += cIn; cachedInputCost += cCached; outputCost += cOut;
+    if (ev.ts) {
+      const d = new Date(ev.ts);
+      const dayKey = localDateKey(d), hourKey = localHourKey(d);
+      (costsByDayFinal[dayKey] ||= {})[m] = (costsByDayFinal[dayKey][m] || 0) + callCost;
+      (costsByHourFinal[hourKey] ||= {})[m] = (costsByHourFinal[hourKey][m] || 0) + callCost;
+      addUsageSample(usageByHour, activeMinutes, d, m, uncached, ev.cachedInp, 0, ev.out, callCost);
     }
-    return out;
-  };
-  const costsByDayFinal  = finalizeRaw(costsByDay);
-  const costsByHourFinal = finalizeRaw(costsByHour);
-
-  const inputCost = tokenCost(uncachedInputTokens, pricing.input_per_million);
-  const cachedInputCost = tokenCost(
-    cachedInputTokens,
-    pricing.cached_input_per_million
-  );
-  const outputCost = tokenCost(outputTokens, pricing.output_per_million);
+  }
+  finalizeActiveMinutes(usageByHour, activeMinutes);
+  const uncachedInputTokens = Math.max(0, inputTokens - cachedInputTokens);
   const totalCost = inputCost + cachedInputCost + outputCost;
+  const pricing = resolveCodexPricing(model);
 
   return {
     provider: "codex",
@@ -1608,9 +1617,38 @@ async function extractCodexSessionData(sessionFile, childFiles) {
     },
     costsByDay: costsByDayFinal,
     costsByHour: costsByHourFinal,
+    usageByHour,
+    models: [...modelsSeen].sort(),
     metrics,
     _localDates: true,
+    _usageByHour: true,
+    _codexCacheV1: true, // disk-cache format flag for Codex results (see safeExtractSessionData)
+    _childFiles: [...(childFiles || [])].sort(), // needed to rebuild the cache key when pruning
   };
+}
+
+// Per-hour, per-model usage used by the Cost view. Minute-level activity is
+// collected as "model|epochMinute" keys and folded into distinct-minute
+// counts per hour at the end (a minute belongs to exactly one hour, so the
+// per-hour counts sum to distinct active minutes over any day-aligned range).
+function addUsageSample(usageByHour, activeMinutes, d, model, inp, cacheR, cacheW, out, cost) {
+  const hourKey = localHourKey(d);
+  const bucket = (usageByHour[hourKey] ||= {});
+  const u = (bucket[model] ||= { inp: 0, cacheR: 0, cacheW: 0, out: 0, cost: 0, turns: 0, activeMin: 0, last: 0 });
+  u.inp += inp; u.cacheR += cacheR; u.cacheW += cacheW; u.out += out; u.cost += cost; u.turns++;
+  const minute = Math.floor(d.getTime() / 60000);
+  if (minute > u.last) u.last = minute;
+  activeMinutes.add(model + "|" + minute);
+}
+
+function finalizeActiveMinutes(usageByHour, activeMinutes) {
+  for (const key of activeMinutes) {
+    const sep = key.lastIndexOf("|");
+    const model = key.slice(0, sep);
+    const hourKey = localHourKey(new Date(parseInt(key.slice(sep + 1), 10) * 60000));
+    const u = usageByHour[hourKey] && usageByHour[hourKey][model];
+    if (u) u.activeMin++;
+  }
 }
 
 function resolveClaudePricing(model) {
@@ -1641,6 +1679,8 @@ async function extractClaudeSessionData(transcriptPath) {
   const costsByModel  = {}; // model → { input, cache_write_5m, cache_write_1h, cache_read, output }
   const costsByDay  = {}; // "YYYY-MM-DD"    (UTC) → { model: float }
   const costsByHour = {}; // "YYYY-MM-DDTHH" (UTC) → { model: float }
+  const usageByHour = {}; // "YYYY-MM-DDTHH" → { model: {inp, cacheR, cacheW, out, cost, turns, activeMin, last} }
+  const activeMinutes = new Set(); // "model|epochMinute"
   const models = {};
   let lastModel = null;
   let lastMainModel = null; // model from main session file only (excludes subagent sidechains)
@@ -1890,6 +1930,7 @@ async function extractClaudeSessionData(transcriptPath) {
       if (!costsByHour[hourKey]) costsByHour[hourKey] = {};
       costsByDay[dateKey][model]  = (costsByDay[dateKey][model]  || 0) + callCost;
       costsByHour[hourKey][model] = (costsByHour[hourKey][model] || 0) + callCost;
+      addUsageSample(usageByHour, activeMinutes, d, model, inp, cacheR, cw5m + cw1h, out, callCost);
     }
     // Per-subagent cost + last-model tracking
     if (!isMain) {
@@ -1911,6 +1952,7 @@ async function extractClaudeSessionData(transcriptPath) {
       `No assistant usage records found in ${transcriptPath}`
     );
 
+  finalizeActiveMinutes(usageByHour, activeMinutes);
   const totalCost = Object.values(costTotals).reduce((a, b) => a + b, 0);
   const totalTokens = Object.values(tokenTotals).reduce((a, b) => a + b, 0);
 
@@ -2051,6 +2093,7 @@ async function extractClaudeSessionData(transcriptPath) {
     },
     costsByDay,
     costsByHour,
+    usageByHour,
     metrics,
     subagents,
     _localDates: true,
@@ -2062,6 +2105,7 @@ async function extractClaudeSessionData(transcriptPath) {
     _subagentContext: true,     // cache bust: per-subagent context usage added
     _prettyMcpDetails: true,   // cache bust: MCP tool detail extraction improved (UUID server names)
     _pricingRefresh2026_09: true, // cache bust: models priced $0 before LiteLLM had their rates (e.g. claude-fable-5-1) need a one-time recompute now that pricing exists
+    _usageByHour: true, // cache bust: per-hour per-model usage + active minutes for the Cost view
   };
 }
 
@@ -2087,7 +2131,8 @@ function pruneDiskCache() {
   for (const key of Object.keys(_diskCache)) {
     const filePath = key.split("|")[0];
     // Remove if file no longer exists or has been superseded by a newer entry
-    if (diskCacheKey(filePath) !== key) {
+    const entry = _diskCache[key];
+    if (diskCacheKey(filePath, entry && entry._childFiles) !== key) {
       delete _diskCache[key];
       _diskCacheDirty = true;
     }
@@ -2121,9 +2166,14 @@ function saveUiPrefs(prefs) {
   } catch { /* best effort */ }
 }
 
-function diskCacheKey(filePath) {
+function diskCacheKey(filePath, childFiles) {
   try {
     const st = statSync(filePath);
+    // Codex child threads (separate files folded into this session) also invalidate.
+    let childTag = "";
+    for (const cf of [...(childFiles || [])].sort()) {
+      try { const cs = statSync(cf); childTag += `|c${cs.size}:${cs.mtimeMs}`; } catch { /* vanished */ }
+    }
     // For Claude transcripts, also fold in the max mtime across all subagent jsonl
     // files. The parent jsonl's mtime alone doesn't reflect activity in a running
     // subagent (whose file is appended in-process by Claude Code without touching
@@ -2145,7 +2195,7 @@ function diskCacheKey(filePath) {
         subTag = `|${maxSubMtime}`;
       } catch { /* no subagents dir */ }
     }
-    return `${filePath}|${st.size}|${st.mtimeMs}${subTag}`;
+    return `${filePath}|${st.size}|${st.mtimeMs}${subTag}${childTag}`;
   } catch {
     return null;
   }
@@ -2285,7 +2335,7 @@ async function safeExtractSessionData(session) {
   // Check disk cache (diskCacheKey includes mtime, so stale entries auto-miss).
   // Also force re-extraction if cached entry lacks metrics (old cache format).
   const cache = loadDiskCache();
-  const dKey = diskCacheKey(session.data_file);
+  const dKey = diskCacheKey(session.data_file, session._childFiles);
   // Cache: require tool_details with {d,ts} format and matching tool counts
   const cachedMetrics = cache[dKey] && cache[dKey].metrics;
   const cachedDetails = cachedMetrics && cachedMetrics.tool_details;
@@ -2307,7 +2357,15 @@ async function safeExtractSessionData(session) {
   const subagentContext = cache[dKey] && cache[dKey]._subagentContext === true;
   const prettyMcpDetails = cache[dKey] && cache[dKey]._prettyMcpDetails === true;
   const pricingRefreshed = cache[dKey] && cache[dKey]._pricingRefresh2026_09 === true;
-  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay && hasLocalDates && hasNoSubagentModel && hasSubagentsField && hasGhostSubagents && subagentCostNumber && subagentDescPairing && subagentContext && prettyMcpDetails && pricingRefreshed) {
+  const hasUsageByHour = cache[dKey] && cache[dKey]._usageByHour === true;
+  const commonValid = dKey && cache[dKey] && detailsValid && hasLinesFields && hasCostsByDay && hasLocalDates && hasUsageByHour;
+  // Claude and Codex results have different shapes; each has its own format flags.
+  // (Codex used to share the Claude-only checks, so it could never hit the cache
+  // and every Codex session was re-parsed on every startup.)
+  const providerValid = session.provider === "codex"
+    ? cache[dKey] && cache[dKey]._codexCacheV1 === true
+    : hasModelBreakdown && hasNoSubagentModel && hasSubagentsField && hasGhostSubagents && subagentCostNumber && subagentDescPairing && subagentContext && prettyMcpDetails && pricingRefreshed;
+  if (commonValid && providerValid) {
     SESSION_DATA_CACHE.set(memKey, cache[dKey]);
     SESSION_DATA_MTIME.set(memKey, effectiveMtime);
     return cache[dKey];
@@ -2354,6 +2412,7 @@ async function annotateListCosts(sessions, plan) {
         if (data.lastModel) session.model = data.lastModel;
         session.costs_by_day  = data.costsByDay  || null;
         session.costs_by_hour = data.costsByHour || null;
+        session.usage_by_hour = data.usageByHour || null;
         // Pre-compute per-session spend for last-hour and today columns
         if (data.costsByDay || data.costsByHour) {
           const nowMs = Date.now();
@@ -4047,6 +4106,11 @@ function createState() {
     bottomTab: 0, // 0=Info, 1=Performance, 2=Processes, 3=Tool Activity, 4=Cost, 5=Config
     hoverTab: -1, // tab index being hovered, -1 = none
     listTab: 0, // 0=Sessions, 1=Live Sessions
+    costView: false, // Cost-by-model view replaces the session list + bottom panels
+    costRange: "today", // COST_RANGES key
+    costSelId: null, // selected tree node id in the Cost view
+    costToggled: new Set(), // tree nodes whose default expansion was flipped
+    costModelScroll: 0,
     hoverListTab: -1, // list tab hover, -1 = none
     configSubTab: 0, // active sub-tab in Config panel
     procSort: "cpu",    // "pid" | "cpu" | "mem" | "cmd" — Processes panel sort column
@@ -5006,7 +5070,10 @@ function renderSubagentHeaderRow(isSelected, width, hScroll, state) {
 function renderFooter(state, width) {
   const items = [
     ["F1", "Help", "f1"], ["F3", "Filter", "f3"], ["F5", "Refresh", "f5"],
-    ["F6", "SortBy", "f6"], ["F7", "Age", "f7"], ["Tab", "Panel", "tab"], ["`", "Live", "backtick"], ["d", "Delete", "d_delete"], ["F10", "Quit", "f10"],
+    ["F6", "SortBy", "f6"], ["F7", "Age", "f7"], ["Tab", "Panel", "tab"],
+    ["`", state.costView ? "Sessions" : state.listTab === 1 ? "Cost" : "Live", "backtick"],
+    ...(state.costView ? [["t", "Range", "cost_range"]] : [["d", "Delete", "d_delete"]]),
+    ["F10", "Quit", "f10"],
   ];
   let line = "";
   state._footerItems = [];
@@ -6566,7 +6633,16 @@ function renderHelpView(width, height) {
   lines.push(BOLD + "  Tabs:" + RESET);
   lines.push("    Tab              Cycle bottom panel tabs");
   lines.push("    1-7              Switch to Info/Performance/Processes/Tool Activity/Subagents/Cost/Config");
-  lines.push("    Shift+Tab / `    Toggle Live filter (show only running sessions)");
+  lines.push("    Shift+Tab / `    Cycle Sessions → Live → Cost views");
+  lines.push("");
+  lines.push(BOLD + "  Cost view:" + RESET);
+  lines.push("    ↑/k, ↓/j         Move in the vendor › harness › model › session tree");
+  lines.push("    →, ←             Expand / collapse (or step into child / back to parent)");
+  lines.push("    Enter, Space     Toggle expand; click ▸/▾ or a selected row to toggle");
+  lines.push("    t                Change time range (Today / Yesterday / 7d / 30d)");
+  lines.push("    PgUp/PgDn        Page through the tree; hover a name to see it in full");
+  lines.push("    Esc, `           Back to the Sessions view");
+  lines.push("    Active time = distinct minutes with a model response; $/HR = cost per active hour");
   lines.push("");
   lines.push(BOLD + "  Other:" + RESET);
   lines.push("    /, F3            Filter sessions by text");
@@ -6937,39 +7013,68 @@ function renderInactivityModal(state, width) {
 // Session list tab bar (posting.sh style)
 // ---------------------------------------------------------------------------
 
-function renderListTabBar(state, width) {
+/**
+ * Upper-pane tab header, styled like the bottom panel's (two lines: labels in
+ * the top border, then a rule with ━ under the active tab). `rightPlain` /
+ * `rightStyled` is an optional right-aligned control strip (Live toggle, range
+ * tabs). Records click geometry in state._upperTabs / state._upperTabRow and
+ * returns the 1-based column where the right strip starts.
+ */
+function renderUpperTabBar(state, width, activeKey, rightPlain, rightStyled, firstRow) {
   const bc = C.border;
-
+  const dimRule = "\x1b[38;5;238m";
   const totalCount = state.sessions.length;
   const liveCount = state.sessions.filter((s) => !!s.process).length;
+  const tabs = [
+    { key: "sessions", label: `Sessions (${state.listTab === 1 ? liveCount + "/" : ""}${totalCount})` },
+    { key: "cost", label: "Cost" },
+  ];
+  state._upperTabs = [];
+  let col = 4; // 1-based: ╭(1) ─(2) space(3)
+  let top = bc + BOX.tl + BOX.h + " " + RESET;
+  let rule = bc + BOX.v + RESET + dimRule + "──" + RESET;
+  tabs.forEach((t, i) => {
+    if (i > 0) { top += "  "; rule += dimRule + "──" + RESET; col += 2; }
+    state._upperTabs.push({ key: t.key, start: col, end: col + t.label.length - 1 });
+    col += t.label.length;
+    const hover = state._upperTabHover === t.key;
+    if (t.key === activeKey) {
+      top += C.panelTitle + t.label + RESET;
+      rule += C.borderHi + "━".repeat(t.label.length) + RESET;
+    } else if (hover) {
+      top += "\x1b[4;38;5;179m" + t.label + RESET;
+      rule += "\x1b[38;5;245m" + "━".repeat(t.label.length) + RESET;
+    } else {
+      top += "\x1b[38;5;245m" + t.label + RESET;
+      rule += dimRule + "─".repeat(t.label.length) + RESET;
+    }
+  });
+  const labelsLen = col - 4;
+  const rightLen = rightPlain ? [...rightPlain].length : 0;
+  // ╭─␠<labels>␠<filler>␠<right>␠╮
+  const filler = Math.max(0, width - labelsLen - rightLen - 7);
+  top += " " + bc + BOX.h.repeat(filler) + RESET + " " + (rightStyled || "") + " " + bc + BOX.tr + RESET;
+  rule += dimRule + "─".repeat(Math.max(0, width - labelsLen - 4)) + RESET + bc + BOX.v + RESET;
+  state._upperTabRow = firstRow;
+  return { lines: [top, rule], rightStartCol: width - rightLen - 1 };
+}
+
+/** Which upper tab (if any) is at this position. */
+function upperTabAt(state, row, col) {
+  if (!state._upperTabRow || (row !== state._upperTabRow && row !== state._upperTabRow + 1)) return null;
+  const t = (state._upperTabs || []).find(t => col >= t.start && col <= t.end);
+  return t ? t.key : null;
+}
+
+function renderListTabBar(state, width, firstRow) {
   const isLive = state.listTab === 1;
-
-  // Title always uses the same format so nothing shifts when toggled
-  const title = `Sessions (${isLive ? liveCount + "/" : ""}${totalCount})`;
-
-  // Live button fixed to the right, just before the closing ╮
   const liveLabel = isLive ? "[Live ●]" : "[Live ○]";
-  // Button sits at fixed right position regardless of title length
-  // 1-based: width - ╮(1) - space(1) - label = width - liveLabel.length - 1
-  const liveBtnCol = width - liveLabel.length - 1;
-  state._liveBtn = { col: liveBtnCol, len: liveLabel.length };
-
-  // Top border: ╭─ <title> ─────── [Live ○] ╮
-  // Fixed visible widths: ╭(1) ─(1) space(1) title space(1) ─*filler space(1) label space(1) ╮(1) = title+label+7
-  const fillerLen = Math.max(0, width - title.length - liveLabel.length - 7);
-  let topLine = bc + BOX.tl + BOX.h + " " + RESET;
-  topLine += C.hdrLabel + title + RESET + " ";
-  topLine += bc + BOX.h.repeat(fillerLen) + RESET + " ";
-  if (isLive) {
-    topLine += "\x1b[1;38;5;114m" + liveLabel + RESET;
-  } else if (state._liveHover) {
-    topLine += "\x1b[4;38;5;179m" + liveLabel + RESET;
-  } else {
-    topLine += "\x1b[38;5;245m" + liveLabel + RESET;
-  }
-  topLine += " " + bc + BOX.tr + RESET;
-
-  return topLine;
+  const liveStyled = isLive ? "\x1b[1;38;5;114m" + liveLabel + RESET
+    : state._liveHover ? "\x1b[4;38;5;179m" + liveLabel + RESET
+    : "\x1b[38;5;245m" + liveLabel + RESET;
+  const { lines, rightStartCol } = renderUpperTabBar(state, width, "sessions", liveLabel, liveStyled, firstRow);
+  state._liveBtn = { col: rightStartCol, len: liveLabel.length };
+  return lines.join("\n");
 }
 
 /** Given a 1-based column, return 1 if the Live button was clicked, or -1. */
@@ -6980,6 +7085,397 @@ function listTabAtX(col, state) {
     return state.listTab === 1 ? 0 : 1;
   }
   return -1;
+}
+
+// ---------------------------------------------------------------------------
+// Cost view: spend broken down by model over a time range
+// ---------------------------------------------------------------------------
+
+const COST_RANGES = [
+  { key: "today", label: "Today" },
+  { key: "yesterday", label: "Yesterday" },
+  { key: "7d", label: "7d" },
+  { key: "30d", label: "30d" },
+];
+
+/** [startKey, endKey) as local hour keys ("YYYY-MM-DDTHH"), day-aligned. */
+function costRangeBounds(rangeKey, now = new Date()) {
+  const day0 = new Date(now);
+  day0.setHours(0, 0, 0, 0);
+  const shift = (days) => { const d = new Date(day0); d.setDate(d.getDate() + days); return d; };
+  const key = (d) => localDateKey(d) + "T00";
+  switch (rangeKey) {
+    case "yesterday": return [key(shift(-1)), key(day0)];
+    case "7d": return [key(shift(-6)), key(shift(1))];
+    case "30d": return [key(shift(-29)), key(shift(1))];
+    default: return [key(day0), key(shift(1))];
+  }
+}
+
+const COST_BLANK = () => ({ cost: 0, activeMin: 0, turns: 0, inp: 0, cacheR: 0, cacheW: 0, out: 0, last: 0 });
+function costAdd(dst, u) {
+  dst.cost += u.cost; dst.activeMin += u.activeMin; dst.turns += u.turns;
+  dst.inp += u.inp; dst.cacheR += u.cacheR; dst.cacheW += u.cacheW; dst.out += u.out;
+  if (u.last > dst.last) dst.last = u.last;
+}
+
+function sessionVendor(s) {
+  return s.provider === "codex" ? "OpenAI" : "Anthropic";
+}
+
+/** The tool that drove the session (from Claude's entrypoint / Codex's originator). */
+function sessionHarness(s) {
+  if (s.provider === "codex") {
+    const o = s.originator || "";
+    if (o === "Codex Desktop") return "Codex Desktop";
+    if (o === "codex_exec") return "Codex exec";
+    if (/vscode/i.test(o)) return "Codex (VS Code)";
+    if (!o || o === "codex-tui" || o === "codex_cli_rs") return "Codex CLI";
+    return o;
+  }
+  if (s.surface === "desktop-cowork") return "Cowork";
+  if (s.surface === "desktop-code") return "Claude Desktop";
+  const e = s.entrypoint || "";
+  if (e === "claude-desktop") return "Claude Desktop";
+  if (!e || e === "cli") return "Claude Code CLI";
+  if (/vscode/i.test(e)) return "Claude Code (VS Code)";
+  if (/^sdk/i.test(e)) return "Agent SDK";
+  return e;
+}
+
+/**
+ * Cost view tree for a range: vendor → harness → model → session. Every node
+ * carries aggregate usage for its subtree; a session leaf carries that
+ * session's usage for that one model. Children are sorted by cost.
+ */
+function computeCostTree(sessions, rangeKey) {
+  const [startKey, endKey] = costRangeBounds(rangeKey);
+  const root = { id: "", kind: "root", depth: -1, children: new Map(), sessions: new Set(), ...COST_BLANK() };
+  const child = (parent, idPart, props) => {
+    const id = parent.id ? `${parent.id}/${idPart}` : idPart;
+    let n = parent.children.get(id);
+    if (!n) {
+      n = { id, depth: parent.depth + 1, parent, children: new Map(), sessions: new Set(), ...COST_BLANK(), ...props };
+      parent.children.set(id, n);
+    }
+    return n;
+  };
+  const sessionCost = new Map(); // session → cost across all models in range
+  for (const s of sessions) {
+    if (!s.usage_by_hour) continue;
+    const perModel = new Map();
+    for (const [hourKey, models] of Object.entries(s.usage_by_hour)) {
+      if (hourKey < startKey || hourKey >= endKey) continue;
+      for (const [m, u] of Object.entries(models)) {
+        if (!perModel.has(m)) perModel.set(m, COST_BLANK());
+        costAdd(perModel.get(m), u);
+      }
+    }
+    if (!perModel.size) continue;
+    const vendor = sessionVendor(s);
+    const harness = sessionHarness(s);
+    let total = 0;
+    for (const [m, u] of perModel) {
+      total += u.cost;
+      const v = child(root, `v:${vendor}`, { kind: "vendor", label: vendor });
+      const h = child(v, `h:${harness}`, { kind: "harness", label: harness });
+      const mn = child(h, `m:${m}`, { kind: "model", label: m });
+      const leaf = child(mn, `s:${s.provider}:${s.session_id}`, {
+        kind: "session", session: s, label: s.title || s._abbrevLabel || s.label_source || s.session_id,
+      });
+      costAdd(leaf, u);
+      leaf.sessions.add(s);
+      for (let n = mn; n; n = n.parent) { costAdd(n, u); n.sessions.add(s); }
+    }
+    sessionCost.set(s, total);
+  }
+  const finalize = (n) => {
+    n.kids = [...n.children.values()].sort((a, b) => b.cost - a.cost);
+    n.kids.forEach(finalize);
+  };
+  finalize(root);
+  root.sessionCost = sessionCost;
+  return root;
+}
+
+/** Vendors and harnesses start expanded, models collapsed; toggles flip that. */
+function costNodeExpanded(state, n) {
+  if (!n.kids || !n.kids.length) return false;
+  return (n.depth < 2) !== state.costToggled.has(n.id);
+}
+
+function flattenCostTree(state, root) {
+  const out = [];
+  const walk = (n) => {
+    for (const k of n.kids) {
+      out.push(k);
+      if (costNodeExpanded(state, k)) walk(k);
+    }
+  };
+  walk(root);
+  return out;
+}
+
+function fmtActiveMin(min) {
+  if (!min) return "0m";
+  if (min < 60) return `${min}m`;
+  const h = Math.floor(min / 60);
+  return `${h}h${String(min % 60).padStart(2, "0")}m`;
+}
+
+function fmtCacheShare(u) {
+  const inputSide = u.inp + u.cacheR + u.cacheW;
+  return inputSide > 0 ? `${Math.round((u.cacheR / inputSide) * 100)}%` : "─";
+}
+
+function fmtPerHour(u) {
+  return u.activeMin > 0 ? compactUsd(u.cost / (u.activeMin / 60)) : "─";
+}
+
+/** Lay out columns: returns a formatter that pads each cell and a header string. */
+function costColumns(cols, width) {
+  const fixed = cols.reduce((n, c) => n + (c.flex ? 0 : c.width + 1), 1);
+  const flexW = Math.max(10, width - fixed);
+  const cell = (c, text) => padOrClip(text, c.flex ? flexW : c.width, c.align);
+  // styles[i] colors cell i; `base` is re-applied after each styled cell so a
+  // row background (e.g. selection) survives the RESET.
+  const row = (texts, styles, base = "") => " " + cols.map((c, i) => {
+    const t = cell(c, texts[i] || "");
+    return styles && styles[i] ? styles[i] + t + RESET + base : t;
+  }).join(" ");
+  return { row, header: row(cols.map(c => c.label)) };
+}
+
+const COST_TREE_COLS = [
+  { label: "VENDOR/HARNESS/MODEL/SESSION", flex: true, align: "left" },
+  { label: "COST", width: 10, align: "right" },
+  { label: "SHARE", width: 5, align: "right" },
+  { label: "SESS", width: 5, align: "right" },
+  { label: "ACTIVE", width: 7, align: "right" },
+  { label: "TURNS", width: 6, align: "right" },
+  { label: "TOKENS", width: 7, align: "right" },
+  { label: "CACHE%", width: 6, align: "right" },
+  { label: "$/HR", width: 8, align: "right" },
+  { label: "LAST", width: 5, align: "right" },
+];
+
+const COST_ROW_STYLE = "\x1b[38;5;252m";     // neutral light gray for the other columns
+
+function costVendorColor(vendor) {
+  return vendor === "OpenAI" ? "\x1b[38;5;110m" : "\x1b[38;5;173m"; // muted blue / muted orange
+}
+
+/** Resolve the selected node id, falling back to its nearest visible ancestor. */
+function resolveCostSelection(state, visible) {
+  let id = state.costSelId || "";
+  while (id) {
+    const i = visible.findIndex(n => n.id === id);
+    if (i >= 0) return i;
+    id = id.includes("/") ? id.slice(0, id.lastIndexOf("/")) : "";
+  }
+  return 0;
+}
+
+/** Render the Cost view (tree on top, sessions under the selected node below). */
+function renderCostView(state, boxW, availH, firstRow) {
+  const lines = [];
+  const range = COST_RANGES.find(r => r.key === state.costRange) || COST_RANGES[0];
+  const root = computeCostTree(state.sessions, range.key);
+  const visible = flattenCostTree(state, root);
+  // The tree takes the whole area (5 fixed lines: 2-line tab bar, header, totals, border).
+  const upperH = Math.max(6, availH);
+  const selIdx = resolveCostSelection(state, visible);
+  const sel = visible[selIdx] || null;
+  state.costSelId = sel ? sel.id : null;
+  state._costVisible = visible;
+  state._costSelIdx = selIdx;
+
+  // --- Upper pane: Sessions/Cost tabs, with the time-range selector on the right ---
+  const tabTexts = COST_RANGES.map(r => r.key === range.key ? `[${r.label}]` : ` ${r.label} `);
+  let rangeStyled = "";
+  COST_RANGES.forEach((r, i) => {
+    const t = tabTexts[i];
+    if (r.key === range.key) rangeStyled += "\x1b[1;38;5;114m" + t + RESET;
+    else if (state._costRangeHover === r.key) rangeStyled += "\x1b[4;38;5;179m" + t + RESET;
+    else rangeStyled += "\x1b[38;5;245m" + t + RESET;
+  });
+  const bar = renderUpperTabBar(state, boxW, "cost", tabTexts.join(""), rangeStyled, firstRow);
+  let col = bar.rightStartCol;
+  state._costRangeTabs = COST_RANGES.map((r, i) => {
+    const t = { key: r.key, start: col, end: col + tabTexts[i].length - 1 };
+    col += tabTexts[i].length;
+    return t;
+  });
+  state._costTopRow = firstRow;
+  for (const l of bar.lines) lines.push(l);
+
+  const tc = costColumns(COST_TREE_COLS, boxW - 1);
+  lines.push(C.colHdrBg + padOrClip(tc.header, boxW, "left") + RESET);
+
+  const treeRows = Math.max(1, upperH - 5);
+  if (selIdx < state.costModelScroll) state.costModelScroll = selIdx;
+  if (selIdx >= state.costModelScroll + treeRows) state.costModelScroll = selIdx - treeRows + 1;
+  state.costModelScroll = Math.max(0, Math.min(state.costModelScroll, Math.max(0, visible.length - treeRows)));
+  state._costModelRowStart = firstRow + 3;
+  state._costModelRowCount = treeRows;
+  const cells = (u, label, isLeaf) => [
+    label, compactUsd(u.cost), root.cost > 0 ? `${Math.round((u.cost / root.cost) * 100)}%` : "─",
+    isLeaf ? "" : String(u.sessions instanceof Set ? u.sessions.size : u.sessions),
+    fmtActiveMin(u.activeMin), String(u.turns),
+    compactTokens(u.inp + u.cacheR + u.cacheW + u.out), fmtCacheShare(u), fmtPerHour(u),
+    u.last ? relativeAge(new Date(u.last * 60000).toISOString(), Date.now()) : "─",
+  ];
+  for (let i = 0; i < treeRows; i++) {
+    const idx = state.costModelScroll + i;
+    const n = visible[idx];
+    if (!n) {
+      lines.push(i === 0 && visible.length === 0 ? C.dimText + `  No usage in ${range.label.toLowerCase()}` + RESET : "");
+      continue;
+    }
+    const isLeaf = n.kind === "session";
+    const glyph = isLeaf ? (n.session.process ? "● " : "○ ") : costNodeExpanded(state, n) ? "▾ " : "▸ ";
+    const label = "  ".repeat(n.depth) + glyph + n.label;
+    let vendorNode = n;
+    while (vendorNode.depth > 0) vendorNode = vendorNode.parent;
+    const nameStyle = (n.kind === "vendor" ? "\x1b[1m" : "") + costVendorColor(vendorNode.label);
+    const base = idx === selIdx ? C.selBg + C.selFg : COST_ROW_STYLE;
+    const text = tc.row(cells(n, label, isLeaf), [nameStyle, costColor(n.cost)], base);
+    lines.push(base + padOrClip(text, boxW, "left") + RESET);
+  }
+  const total = { ...root, sessions: root.sessions.size };
+  lines.push(C.hdrValue + padOrClip(tc.row(cells(total, "TOTAL", false), [null, costColor(total.cost)], C.hdrValue), boxW, "left") + RESET);
+  lines.push(boxBottom(boxW));
+
+  // Hover tooltip for the name column (labels get truncated on narrow terminals).
+  state._costTip = null;
+  const hv = state._costHover;
+  const nameW = boxW - 1 - COST_TREE_COLS.reduce((n, col) => n + (col.flex ? 0 : col.width + 1), 1);
+  if (hv && hv.col >= 2 && hv.col <= 1 + nameW) {
+    const i = hv.row - state._costModelRowStart;
+    const n = i >= 0 && i < treeRows ? visible[state.costModelScroll + i] : null;
+    if (n) {
+      const path = [];
+      for (let p = n; p && p.kind !== "root"; p = p.parent) path.unshift(p.label);
+      const tip = [path.join(" › ")];
+      if (n.kind === "session") {
+        const s = n.session;
+        if (s.label_source) tip.push("Project: " + s.label_source);
+        tip.push(`Session: ${s.provider}:${s.session_id}${s.process ? "  (running)" : ""}`);
+      }
+      state._costTip = { row: hv.row + 1, x: Math.max(0, hv.col - 2), lines: tip };
+    }
+  }
+  return lines;
+}
+
+/** Keyboard/mouse handling for the Cost view. Returns true if the event was consumed. */
+function handleCostViewEvent(state, event) {
+  const visible = state._costVisible || [];
+  const idx = Math.max(0, Math.min(state._costSelIdx || 0, visible.length - 1));
+  const cur = visible[idx];
+  const select = (i) => {
+    if (!visible.length) return;
+    const n = visible[Math.max(0, Math.min(visible.length - 1, i))];
+    state.costSelId = n.id;
+    state.dirty = true;
+  };
+  const toggle = (n) => {
+    if (!n || !n.kids || !n.kids.length) return;
+    if (state.costToggled.has(n.id)) state.costToggled.delete(n.id);
+    else state.costToggled.add(n.id);
+    state.dirty = true;
+  };
+  const cycleRange = (dir) => {
+    const i = COST_RANGES.findIndex(r => r.key === state.costRange);
+    state.costRange = COST_RANGES[(i + dir + COST_RANGES.length) % COST_RANGES.length].key;
+    saveUiPrefs({ costRange: state.costRange });
+    state.dirty = true;
+  };
+  const page = Math.max(1, (state._costModelRowCount || 10) - 1);
+
+  if (event.type === "char") {
+    switch (event.char) {
+      case "t": cycleRange(1); return true;
+      case "k": select(idx - 1); return true;
+      case "j": select(idx + 1); return true;
+      case " ": toggle(cur); return true;
+      case "d": case "1": case "2": case "3": case "4": case "5": case "6": case "7":
+      case "P": case "M": case "T": case ">": case "<":
+        return true; // session-list actions don't apply here
+      default: return false;
+    }
+  }
+  switch (event.type) {
+    case "up": select(idx - 1); return true;
+    case "down": select(idx + 1); return true;
+    case "home": select(0); return true;
+    case "end": select(visible.length - 1); return true;
+    case "pageup": select(idx - page); return true;
+    case "pagedown": select(idx + page); return true;
+    case "right":
+      // Expand; if already expanded, step into the first child.
+      if (cur && cur.kids && cur.kids.length) {
+        if (!costNodeExpanded(state, cur)) toggle(cur);
+        else select(idx + 1);
+      }
+      return true;
+    case "left":
+      // Collapse; if already collapsed (or a leaf), jump to the parent.
+      if (cur && costNodeExpanded(state, cur)) toggle(cur);
+      else if (cur && cur.parent && cur.parent.kind !== "root") {
+        state.costSelId = cur.parent.id;
+        state.dirty = true;
+      }
+      return true;
+    case "enter": toggle(cur); return true;
+    case "escape": closeCostView(state); return true;
+    case "tab": case "f6": case "drag": return true;
+    case "scroll_up": state._costHover = null; select(idx - 1); return true;
+    case "scroll_down": state._costHover = null; select(idx + 1); return true;
+    case "hover": {
+      const onTop = event.row === state._costTopRow;
+      const onTabs = onTop && (state._costRangeTabs || []).find(t => event.col >= t.start && event.col <= t.end);
+      const hover = onTabs ? onTabs.key : null;
+      if (hover !== state._costRangeHover) { state._costRangeHover = hover; state.dirty = true; }
+      const tabHover = upperTabAt(state, event.row, event.col);
+      if (tabHover !== (state._upperTabHover || null)) { state._upperTabHover = tabHover; state.dirty = true; }
+      const prev = state._costHover;
+      if (!prev || prev.row !== event.row || prev.col !== event.col) {
+        state._costHover = { row: event.row, col: event.col };
+        if (state._costTip || (event.row >= state._costModelRowStart && event.row < state._costModelRowStart + state._costModelRowCount)) state.dirty = true;
+      }
+      return true;
+    }
+    case "click": {
+      if (state._footerRow && event.row === state._footerRow) return false; // footer handled normally
+      if (upperTabAt(state, event.row, event.col) === "sessions") {
+        state._upperTabHover = null;
+        closeCostView(state);
+        return true;
+      }
+      if (event.row === state._costTopRow) {
+        const t = (state._costRangeTabs || []).find(t => event.col >= t.start && event.col <= t.end);
+        if (t && t.key !== state.costRange) {
+          state.costRange = t.key;
+          saveUiPrefs({ costRange: state.costRange });
+          state.dirty = true;
+        }
+        return true;
+      }
+      const r = event.row - state._costModelRowStart;
+      if (r >= 0 && r < state._costModelRowCount) {
+        const i = state.costModelScroll + r;
+        const n = visible[i];
+        if (!n) return true;
+        // Click the ▸/▾ glyph, or an already-selected row, to expand/collapse.
+        const glyphCol = 2 + n.depth * 2;
+        if (i === idx || event.col === glyphCol || event.col === glyphCol + 1) toggle(n);
+        select(i);
+      }
+      return true;
+    }
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -7030,8 +7526,8 @@ function render(state) {
   const rawPanelH = Math.min(MAX_PANEL, Math.max(MIN_PANEL, Math.floor(totalBody * 0.4)));
   const panelHeight = Math.min(rawPanelH, Math.max(3, totalBody - 5)); // ensure list gets at least 5 rows
   const listAreaH = totalBody - panelHeight;
-  // List area = boxTop(1) + colHeader(1) + rows + boxBottom(1)
-  const listHeight = Math.max(1, listAreaH - 3);
+  // List area = tab bar(2) + colHeader(1) + rows + boxBottom(1)
+  const listHeight = Math.max(1, listAreaH - 4);
   const now = new Date();
   // Recompute the virtual row list (sessions + markers + expanded children) every render
   // so changes to filtered/sorted sessions or expansion state are picked up.
@@ -7042,6 +7538,12 @@ function render(state) {
     s.surface === "desktop-cowork" ? "cowork" : isDesktopSession(s) ? "code" : "cli"));
   _showModelGlyphs = _surfaceTypes.size > 1;
 
+  if (state.costView) {
+    // Clear session-list geometry so stale click/scroll targets can't fire.
+    state._liveBtn = null;
+    state._listTabBarRow = 0; state._colHeaderRow = 0; state._tabBarRow = 0; state._configPanelTop = 0;
+    for (const l of renderCostView(state, boxW, listAreaH + panelHeight, screenLines.length + 1)) screenLines.push(l);
+  } else {
   // Adjust scroll to keep selection visible
   if (state.selectedRow < state.scrollOffset) {
     state.scrollOffset = state.selectedRow;
@@ -7051,7 +7553,7 @@ function render(state) {
 
   // Session list box with tabs (2 lines: top border + underline rule)
   state._listTabBarRow = screenLines.length + 1; // 1-based row
-  const tabBarLines = renderListTabBar(state, boxW).split("\n");
+  const tabBarLines = renderListTabBar(state, boxW, screenLines.length + 1).split("\n");
   for (const tbl of tabBarLines) screenLines.push(tbl);
   state._colHeaderRow = screenLines.length + 1; // 1-based row of column header
   screenLines.push(renderColumnHeaders(state, boxW));
@@ -7082,6 +7584,7 @@ function render(state) {
   state._configPanelTop = screenLines.length + 3; // 1-based: tab bar + rule line → first content row
   const bottomLines = renderBottomPanels(selected, state.panelData, panelPlan, boxW, panelHeight, resolveActiveTab(state, state.panelData), state.hoverTab, state);
   for (const pl of bottomLines) screenLines.push(pl);
+  }
 
   // Limits panel (below bottom panels)
   for (const line of limitsLines) screenLines.push(line);
@@ -7205,6 +7708,35 @@ function render(state) {
   }
 
   // Overlay column header tooltip on hover
+  // Cost view: tooltip with the full (untruncated) tree label under the mouse
+  if (state.costView && state.mode === "list" && state._costTip) {
+    const tip = state._costTip;
+    const tipBorder = "\x1b[38;5;60;48;5;236m";
+    const tipText = "\x1b[38;5;252;48;5;236m";
+    const tipHead = "\x1b[1;38;5;252;48;5;236m";
+    const inner = Math.min(width - 6, Math.max(...tip.lines.map(l => ansiLen(l))));
+    const tipW = inner + 4;
+    const tipLines = [tipBorder + "╭" + "─".repeat(tipW - 2) + "╮" + RESET];
+    tip.lines.forEach((l, i) => {
+      tipLines.push(tipBorder + "│" + RESET + (i === 0 ? tipHead : tipText) + " " + padOrClip(l, inner, "left") + " " + RESET + tipBorder + "│" + RESET);
+    });
+    tipLines.push(tipBorder + "╰" + "─".repeat(tipW - 2) + "╯" + RESET);
+    // Below the hovered row if it fits, otherwise above it (tip.row is 1-based, one below the row)
+    let top = tip.row - 1;
+    if (top + tipLines.length > screenLines.length - 1) top = Math.max(0, tip.row - 2 - tipLines.length);
+    const tipX = Math.max(0, Math.min(tip.x, width - 1 - tipW));
+    for (let t = 0; t < tipLines.length; t++) {
+      const r = top + t;
+      if (r >= screenLines.length) break;
+      const bgLine = screenLines[r] || "";
+      const left = ansiSlice(bgLine, 0, tipX);
+      const rightStart = tipX + tipW;
+      const bgLen = ansiLen(bgLine);
+      const right = rightStart < bgLen ? ansiSlice(bgLine, rightStart, width - rightStart) : "";
+      screenLines[r] = left + (ansiLen(left) < tipX ? " ".repeat(tipX - ansiLen(left)) : "") + tipLines[t] + right + RESET;
+    }
+  }
+
   if (state._hoverColKey && state._colHeaderRow) {
     const cols = activeColumns(state);
     const col = cols.find(c => c.key === state._hoverColKey);
@@ -7607,6 +8139,7 @@ function handleEvent(event, state) {
   }
 
   // --- List mode ---
+  if (state.costView && handleCostViewEvent(state, event)) return;
   const listLen = (state.flatList && state.flatList.length) || state.filtered.length;
   const bodyHeight = Math.max(1, (process.stdout.rows || 24) - (state.headerLines + 2));
 
@@ -7837,6 +8370,7 @@ function handleEvent(event, state) {
               case "f6": openSortBy(state); break;
               case "tab": cycleBottomTab(state, 1); break;
               case "backtick": switchListTab(state); break;
+              case "cost_range": handleCostViewEvent(state, { type: "char", char: "t" }); break;
               case "d_delete": { const sel = getSelectedSession(state); if (sel && !sel.process) { state.mode = "delete"; state.dirty = true; } break; }
               case "f7": { const idx = INACTIVITY_OPTIONS.findIndex(o => o.key === state.inactivityFilter); state._inactivityCursor = idx >= 0 ? idx : INACTIVITY_OPTIONS.length - 1; state.mode = "inactivity"; state.dirty = true; break; }
               case "f10": state.quit = true; break;
@@ -7847,6 +8381,11 @@ function handleEvent(event, state) {
         return;
       }
       // Check if click is on the list tab bar (top border or underline row)
+      if (upperTabAt(state, event.row, event.col) === "cost") {
+        state._upperTabHover = null;
+        openCostView(state);
+        return;
+      }
       if (state._listTabBarRow && event.row === state._listTabBarRow) {
         const ltIdx = listTabAtX(event.col, state);
         if (ltIdx >= 0 && ltIdx !== state.listTab) {
@@ -8133,6 +8672,8 @@ function handleEvent(event, state) {
         const idx = listTabAtX(event.col, state);
         if (idx >= 0) { newListHover = idx; newLiveHover = true; }
       }
+      const newUpperHover = upperTabAt(state, event.row, event.col);
+      if (newUpperHover !== (state._upperTabHover || null)) { state._upperTabHover = newUpperHover; state.dirty = true; }
       // Track hover over config sub-tabs and scrollbar
       let newConfigHover = -1;
       let newScrollHover = false;
@@ -8280,15 +8821,32 @@ function handleEvent(event, state) {
 /** Save current sort to per-tab state, switch to newTab, restore its sort. */
 function switchToListTab(state, newTab) {
   state.listTab = newTab;
+  state.costView = false;
   state.selectedRow = 0;
   state.scrollOffset = 0;
   applySortAndFilter(state);
   state.dirty = true;
-  saveUiPrefs({ bottomTab: state.bottomTab, listTab: state.listTab, tabSort: state._tabSort });
+  saveUiPrefs({ bottomTab: state.bottomTab, listTab: state.listTab, tabSort: state._tabSort, costView: false });
 }
 
+function openCostView(state) {
+  state.costView = true;
+  state.dirty = true;
+  saveUiPrefs({ costView: true });
+}
+
+/** Back to the session list as it was (keeps Live filter and selection). */
+function closeCostView(state) {
+  state.costView = false;
+  state.dirty = true;
+  saveUiPrefs({ costView: false });
+}
+
+/** Backtick cycles Sessions → Live → Cost → Sessions. */
 function switchListTab(state) {
-  switchToListTab(state, state.listTab === 0 ? 1 : 0);
+  if (state.costView) switchToListTab(state, 0);
+  else if (state.listTab === 0) switchToListTab(state, 1);
+  else openCostView(state);
 }
 
 function openSortBy(state) {
@@ -8695,6 +9253,8 @@ async function main() {
   const _savedPrefs = loadUiPrefs();
   if (typeof _savedPrefs.bottomTab === "number") state.bottomTab = _savedPrefs.bottomTab;
   if (typeof _savedPrefs.listTab === "number") state.listTab = _savedPrefs.listTab;
+  if (typeof _savedPrefs.costView === "boolean") state.costView = _savedPrefs.costView;
+  if (COST_RANGES.some(r => r.key === _savedPrefs.costRange)) state.costRange = _savedPrefs.costRange;
   if (typeof _savedPrefs.agentLiveFilter === "boolean") state.agentLiveFilter = _savedPrefs.agentLiveFilter;
   const restoreSort = (saved) =>
     saved && typeof saved === "object" && typeof saved.col === "string" && SUBAGENT_SORT_COLS[saved.col]
