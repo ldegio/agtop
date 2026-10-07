@@ -31,14 +31,12 @@ import {
   readdirSync,
   existsSync,
   statSync,
-  createReadStream,
   openSync,
   fstatSync,
   readSync,
   closeSync,
   rmSync,
 } from "node:fs";
-import { createInterface } from "node:readline";
 import { join, basename, dirname, sep } from "node:path";
 import { homedir, cpus } from "node:os";
 import { spawn, execSync } from "node:child_process";
@@ -325,32 +323,86 @@ NOTES
 // File helpers
 // ---------------------------------------------------------------------------
 
+const JSONL_MAX_LINE_BYTES = 524_288;
+
+// Stream a JSONL file and call `callback(item)` for each parsed line.
+//
+// Works on raw bytes and only decodes lines that will actually be parsed.
+// Lines over JSONL_MAX_LINE_BYTES are skipped without ever becoming strings:
+// they're image payloads or Codex `compacted` records (each embedding the
+// whole prior history, ~8MB apiece) that carry no token/cost/tool data. A
+// 600MB live session file was >99% such lines, and a readline-based reader
+// spent its time widening each of them to a two-byte JS string just to drop
+// it — re-parsed on every refresh tick, that pinned a core.
 async function forEachJsonl(filePath, callback) {
-  const stream = createReadStream(filePath, { encoding: "utf-8" });
-  const rl = createInterface({ input: stream, crlfDelay: Infinity });
-  let lineNum = 0;
+  let fd;
   try {
-    for await (const raw of rl) {
-      lineNum++;
-      // Yield to the event loop every 1000 lines so UI input isn't blocked
-      // by large transcript files during background refresh.
-      if (lineNum % 1000 === 0) await new Promise(r => setImmediate(r));
-      // Skip lines >512KB — these are almost always base64 image payloads
-      // and contain no token/cost/tool data worth extracting.
-      if (raw.length > 524_288) continue;
-      const line = raw.trim();
-      if (!line) continue;
-      let item;
-      try {
-        item = JSON.parse(line);
-      } catch {
-        continue; // skip corrupted/truncated lines (e.g. null-byte padding)
-      }
-      callback(item);
+    fd = openSync(filePath, "r");
+  } catch (err) {
+    throw new SessionCostError(`Unable to read ${filePath}: ${err.message}`);
+  }
+  const chunk = Buffer.alloc(1 << 20);
+  let pending = []; // buffered pieces of the current (incomplete) line
+  let pendingLen = 0;
+  let skipping = false; // current line already exceeded the limit; drop the rest of it
+  let lineNum = 0;
+  const emit = (buf) => {
+    lineNum++;
+    const line = buf.toString("utf-8").trim();
+    if (!line) return;
+    let item;
+    try {
+      item = JSON.parse(line);
+    } catch {
+      return; // skip corrupted/truncated lines (e.g. null-byte padding, mid-write tail)
     }
+    callback(item);
+  };
+  try {
+    let pos = 0;
+    for (;;) {
+      const n = readSync(fd, chunk, 0, chunk.length, pos);
+      if (n <= 0) break;
+      pos += n;
+      // Only look at the bytes this read filled; the buffer still holds the
+      // previous chunk's tail beyond n, and scanning into it would re-emit lines.
+      const view = chunk.subarray(0, n);
+      let start = 0;
+      for (;;) {
+        const nl = view.indexOf(10, start);
+        if (nl === -1) break;
+        if (skipping) {
+          skipping = false;
+        } else if (pendingLen + (nl - start) > JSONL_MAX_LINE_BYTES) {
+          pending = []; pendingLen = 0;
+        } else if (pending.length) {
+          pending.push(chunk.subarray(start, nl));
+          emit(Buffer.concat(pending));
+          pending = []; pendingLen = 0;
+        } else {
+          emit(chunk.subarray(start, nl));
+        }
+        start = nl + 1;
+      }
+      if (start < n && !skipping) {
+        const rest = n - start;
+        if (pendingLen + rest > JSONL_MAX_LINE_BYTES) {
+          skipping = true; pending = []; pendingLen = 0;
+        } else {
+          pending.push(Buffer.from(chunk.subarray(start, n)));
+          pendingLen += rest;
+        }
+      }
+      // Yield to the event loop between chunks so UI input isn't blocked
+      // by large transcript files during background refresh.
+      await new Promise(r => setImmediate(r));
+    }
+    if (pending.length && !skipping) emit(Buffer.concat(pending)); // final line without trailing newline
   } catch (err) {
     if (err instanceof SessionCostError) throw err;
     throw new SessionCostError(`Unable to read ${filePath}: ${err.message}`);
+  } finally {
+    try { closeSync(fd); } catch {}
   }
 }
 
@@ -2291,6 +2343,9 @@ function litellmToCodexPricing(entry) {
 
 // Track mtime for each in-memory cache entry so we can detect changes.
 const SESSION_DATA_MTIME = new Map();
+// memKey → { ms: last full-parse duration, at: when it finished }
+const _parseCost = new Map();
+const PARSE_THROTTLE_FACTOR = 5;
 
 function fileMtimeMs(filePath) {
   try { return statSync(filePath).mtimeMs; } catch { return 0; }
@@ -2327,7 +2382,15 @@ async function safeExtractSessionData(session) {
     if (effectiveMtime === cachedMtime) {
       return SESSION_DATA_CACHE.get(memKey);
     }
-    // File changed — invalidate
+    // File changed. A live transcript changes on nearly every tick, and each
+    // change means a full re-parse; for a file that takes a long time to
+    // parse, bound the share of CPU that can consume by serving the
+    // slightly-stale result until a multiple of the last parse time has
+    // passed (worst case ~1/PARSE_THROTTLE_FACTOR of a core per file).
+    const pc = _parseCost.get(memKey);
+    if (pc && Date.now() - pc.at < pc.ms * PARSE_THROTTLE_FACTOR) {
+      return SESSION_DATA_CACHE.get(memKey);
+    }
     SESSION_DATA_CACHE.delete(memKey);
     SESSION_DATA_MTIME.delete(memKey);
   }
@@ -2373,11 +2436,14 @@ async function safeExtractSessionData(session) {
 
   try {
     let data = null;
+    const t0 = Date.now();
     if (session.provider === "codex") {
       data = await extractCodexSessionData(session.data_file, session._childFiles);
     } else if (session.provider === "claude") {
       data = await extractClaudeSessionData(session.data_file);
     }
+    const t1 = Date.now();
+    _parseCost.set(memKey, { ms: t1 - t0, at: t1 });
     SESSION_DATA_CACHE.set(memKey, data);
     SESSION_DATA_MTIME.set(memKey, effectiveMtime);
     if (dKey && data) {
@@ -8994,6 +9060,7 @@ function pruneSessionCaches(sessions, contextCache) {
     if (!dataFileKeys.has(key)) {
       SESSION_DATA_CACHE.delete(key);
       SESSION_DATA_MTIME.delete(key);
+      _parseCost.delete(key);
     }
   }
   for (const key of _codexStaticCache.keys()) {
@@ -9335,8 +9402,15 @@ async function main() {
       state.dirty = false;
     }
   };
+  // Skip a tick while the previous refresh is still running: setInterval
+  // doesn't wait for the async callback, so a refresh slower than the
+  // interval (e.g. a huge live transcript being re-parsed) would otherwise
+  // stack up concurrent refreshes, each re-parsing the same files.
+  let refreshInFlight = false;
   const refreshTimer = setInterval(() => {
-    doRefresh().catch(() => {}); // best-effort, ignore errors
+    if (refreshInFlight) return;
+    refreshInFlight = true;
+    doRefresh().catch(() => {}).finally(() => { refreshInFlight = false; }); // best-effort, ignore errors
   }, delayMs);
 
   // Event loop
