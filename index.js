@@ -623,8 +623,14 @@ function loadCodexThreadNames() {
 }
 
 function summarizeCodexSession(filePath) {
-  // Static fields: read once and cache forever.
+  // Static fields: read once and cache forever once the model is known. A
+  // file that has no turn_context yet (just created, or a child thread that
+  // never gets one) is cached against its size+mtime instead, so it's only
+  // re-read when it actually changes rather than on every tick.
+  const st = fileStat(filePath);
+  const sig = st ? `${st.size}:${st.mtimeMs}` : "";
   let staticParts = _codexStaticCache.get(filePath);
+  if (staticParts && !staticParts.model && staticParts._sig !== sig) staticParts = null;
   if (!staticParts) {
     let sessionId = null;
     let startedAt = null;
@@ -650,16 +656,12 @@ function summarizeCodexSession(filePath) {
       }
       if (sessionId && startedAt && model && cwd) break;
     }
-    staticParts = { sessionId, startedAt, model, cwd, parentThreadId, originator };
-    // Only cache once the model is known: a just-created session has
-    // session_meta but no turn_context yet, and caching then would pin
-    // model=null for the rest of this process's life.
-    if (sessionId && model) _codexStaticCache.set(filePath, staticParts);
+    staticParts = { sessionId, startedAt, model, cwd, parentThreadId, originator, _sig: sig };
+    if (sessionId) _codexStaticCache.set(filePath, staticParts);
   }
 
   // Dynamic field: lastActive from mtime — cheap stat, no file read.
-  const mt = fileMtime(filePath);
-  const lastActive = mt ? mt.toISOString() : staticParts.startedAt;
+  const lastActive = st ? st.mtime.toISOString() : staticParts.startedAt;
   const title = staticParts.sessionId ? loadCodexThreadNames().get(staticParts.sessionId) || null : null;
 
   return {
@@ -828,6 +830,16 @@ function fileMtime(filePath) {
   }
 }
 
+function fileStat(filePath) {
+  try {
+    return statSync(filePath);
+  } catch {
+    return null;
+  }
+}
+
+const _macMetaCache = new Map(); // metaPath → { mtimeMs, meta, jsonlPath }
+
 // Cache for the static parts of a session summary (model, cwd, startedAt).
 // These are set in the first few lines and never change, so we only read once.
 const _sessionStaticCache = new Map(); // transcriptPath → { model, cwd, startedAt }
@@ -841,8 +853,13 @@ const _sessionStaticCache = new Map(); // transcriptPath → { model, cwd, start
 const _customTitleCache = new Map(); // transcriptPath → { mtimeMs, customTitle }
 
 function collectClaudeSessionSummary(transcriptPath) {
-  // Static fields that genuinely never change: model, cwd, startedAt.
+  // Static fields that genuinely never change: model, cwd, startedAt. Until
+  // the first assistant message exists the model is unknown; cache those
+  // against size+mtime so they're re-read when the file changes, not every tick.
+  const mainStat = fileStat(transcriptPath);
+  const sig = mainStat ? `${mainStat.size}:${mainStat.mtimeMs}` : "";
   let staticParts = _sessionStaticCache.get(transcriptPath);
+  if (staticParts && !staticParts.model && staticParts._sig !== sig) staticParts = null;
   let aiTitleFromHead = null;
   if (!staticParts) {
     let earliest = null;
@@ -860,12 +877,12 @@ function collectClaudeSessionSummary(transcriptPath) {
       if (item.type === "ai-title" && typeof item.aiTitle === "string") aiTitleFromHead = item.aiTitle;
       if (!entrypoint && typeof item.entrypoint === "string") entrypoint = item.entrypoint;
     }
-    staticParts = { model, cwd, startedAt: formatTimestampForSession(earliest), aiTitle: aiTitleFromHead, entrypoint };
-    if (model) _sessionStaticCache.set(transcriptPath, staticParts); // only cache once we have a model
+    staticParts = { model, cwd, startedAt: formatTimestampForSession(earliest), aiTitle: aiTitleFromHead, entrypoint, _sig: sig };
+    _sessionStaticCache.set(transcriptPath, staticParts);
   }
 
   // Dynamic field: lastActive is just mtime — cheap stat, no file read.
-  let latest = fileMtime(transcriptPath);
+  let latest = mainStat ? mainStat.mtime : null;
   for (const filePath of claudeTranscriptFiles(transcriptPath).slice(1)) {
     const mt = fileMtime(filePath);
     if (mt && (!latest || mt > latest)) latest = mt;
@@ -984,13 +1001,24 @@ function _scanMacSessionsRoot(root, forceSurface, sessions) {
       for (const entry of listDir(deviceDir)) {
         if (!entry.startsWith("local_") || !entry.endsWith(".json")) continue;
         const metaPath = join(deviceDir, entry);
-        let meta;
-        try { meta = JSON.parse(readFileSync(metaPath, "utf-8")); } catch { continue; }
+        // Meta files change rarely; re-parse only when their mtime moves. The
+        // transcript lookup is cached once found (a session's jsonl never moves).
+        const mst = fileStat(metaPath);
+        const metaMtime = mst ? mst.mtimeMs : -1;
+        let mc = _macMetaCache.get(metaPath);
+        if (!mc || mc.mtimeMs !== metaMtime) {
+          let meta;
+          try { meta = JSON.parse(readFileSync(metaPath, "utf-8")); } catch { continue; }
+          mc = { mtimeMs: metaMtime, meta, jsonlPath: mc ? mc.jsonlPath : null };
+          _macMetaCache.set(metaPath, mc);
+        }
+        const meta = mc.meta;
         if (meta.isArchived) continue;
         const cliSessionId = meta.cliSessionId;
         if (!cliSessionId) continue;
         const sessionDir = join(deviceDir, meta.sessionId || entry.replace(/\.json$/, ""));
-        const jsonlPath = findDesktopSessionJsonl(sessionDir, cliSessionId);
+        if (!mc.jsonlPath) mc.jsonlPath = findDesktopSessionJsonl(sessionDir, cliSessionId);
+        const jsonlPath = mc.jsonlPath;
         if (!jsonlPath) continue; // no transcript yet
         const summary = collectClaudeSessionSummary(jsonlPath);
         if (!summary.model && !meta.model) continue; // skip empty sessions
